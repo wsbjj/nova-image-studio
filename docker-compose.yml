@@ -6,7 +6,7 @@ services:
       - "3000:3000"
     volumes:
       - ./data:/app/backend/data
-      - ./blacklist.json:/app/backend/blacklist.json
-      - ./prompts.json:/app/backend/prompts.json
-      - ./.env:/app/backend/.env
+      - ./backend/blacklist.json:/app/backend/blacklist.json
+      - ./backend/prompts.json:/app/backend/prompts.json
+      - ./.env:/app/.env
     restart: unless-stopped

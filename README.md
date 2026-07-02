@@ -185,6 +185,45 @@ docker compose up -d
 
 访问 <http://localhost:3000>。
 
+### 开发预览（本机 Docker）
+
+开发预览会在容器内安装前后端依赖，并以 `NODE_ENV=development` 启动 `backend/server.js`。后端会同时提供 API、WebSocket 和 Next.js dev server，源码通过 bind mount 挂载，适合本机边改边看。
+
+```bash
+# 可选：需要调整运行参数时复制环境变量文件
+cp backend/.env.example .env
+
+# 启动开发预览
+docker compose -f docker-compose.dev.yml up --build
+```
+
+访问 <http://localhost:3000>。
+
+如果 Docker Hub 网络暂时不可用，但本机已有其它 Node 20+ 镜像，可临时指定基础镜像：
+
+```powershell
+$env:NOVA_DEV_NODE_IMAGE = "node:24-bookworm"
+docker compose -f docker-compose.dev.yml up --build
+```
+
+常用命令：
+
+```bash
+# 后台启动
+docker compose -f docker-compose.dev.yml up -d --build
+
+# 查看日志
+docker compose -f docker-compose.dev.yml logs -f
+
+# 停止开发预览
+docker compose -f docker-compose.dev.yml down
+
+# 依赖异常时，删除容器内 node_modules volume 后重装
+docker compose -f docker-compose.dev.yml down -v
+```
+
+生成图片和任务数据库会持久化到本机 `./data/`。
+
 ### 环境变量
 
 通过 `backend/.env` 注入，无需修改镜像。修改后重启生效：

@@ -1756,7 +1756,7 @@ const startServer = () => {
       res.end('Not Found');
       return;
     }
-    handle(req, res, req.url || '/');
+    handle(req, res);
   });
 
   const nextUpgradeHandler = IS_DEV && typeof app.getUpgradeHandler === 'function'
