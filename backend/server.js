@@ -126,6 +126,7 @@ const CUSTOM_IMAGE_SIZE_LIMITS = {
   minPixels: 655360,
   maxPixels: 8294400,
 };
+const NACOS_CONFIG_TIMEOUT_MS = 15 * 1000;
 const IS_DEV = process.env.NODE_ENV !== 'production';
 const STATIC_DIR = path.join(__dirname, '..', 'frontend', 'out');
 const IMAGE_DIR = process.env.NOVA_IMAGE_DIR || path.join(__dirname, 'nova-images');
@@ -1076,6 +1077,251 @@ async function fetchWithTimeout(url, init) {
   }
 }
 
+function normalizeNacosServerUrl(input) {
+  const trimmed = String(input || '').trim().replace(/\/+$/, '');
+  if (!trimmed) {
+    throw createHttpError(400, 'INVALID_NACOS_SERVER', '请填写 Nacos 域名或 IP');
+  }
+
+  const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+  let url;
+  try {
+    url = new URL(withProtocol);
+  } catch {
+    throw createHttpError(400, 'INVALID_NACOS_SERVER', 'Nacos 地址格式无效，请填写域名、IP 或完整控制台地址');
+  }
+
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw createHttpError(400, 'INVALID_NACOS_SERVER', 'Nacos 地址仅支持 http 或 https');
+  }
+
+  return url.origin;
+}
+
+function normalizeNacosConfigFetchPayload(body) {
+  const serverUrl = normalizeNacosServerUrl(body?.serverUrl);
+  const namespaceId = String(body?.namespaceId || 'public').trim() || 'public';
+  const groupName = String(body?.groupName || 'DEFAULT_GROUP').trim() || 'DEFAULT_GROUP';
+  const dataId = String(body?.dataId || 'nova-image-studio-model-registry.json').trim() || 'nova-image-studio-model-registry.json';
+  const username = String(body?.username || '').trim();
+  const password = String(body?.password || '').trim();
+
+  if ((username && !password) || (!username && password)) {
+    throw createHttpError(400, 'INVALID_NACOS_AUTH', 'Nacos 用户名和密码需要同时填写');
+  }
+
+  return {
+    serverUrl,
+    namespaceId,
+    groupName,
+    dataId,
+    username,
+    password,
+  };
+}
+
+async function fetchNacosWithTimeout(url, init) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), NACOS_CONFIG_TIMEOUT_MS);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function readNacosPayload(response) {
+  const text = await response.text().catch(() => '');
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { message: text };
+  }
+}
+
+function getNacosResponseMessage(payload) {
+  if (!payload || typeof payload !== 'object') return '';
+  if (typeof payload.message === 'string') return payload.message;
+  if (typeof payload.error === 'string') return payload.error;
+  if (payload.data && typeof payload.data === 'object' && typeof payload.data.message === 'string') {
+    return payload.data.message;
+  }
+  return '';
+}
+
+function assertNacosSuccess(response, payload, fallbackMessage) {
+  const message = getNacosResponseMessage(payload);
+  if (!response.ok) {
+    throw new Error(message || `${fallbackMessage}: HTTP ${response.status}`);
+  }
+  if (payload && typeof payload === 'object' && typeof payload.code === 'number' && payload.code !== 0) {
+    throw new Error(message || `${fallbackMessage}: code ${payload.code}`);
+  }
+  if (payload && typeof payload === 'object' && payload.data === false) {
+    throw new Error(message || fallbackMessage);
+  }
+}
+
+async function requestNacosLogin(config, pathname) {
+  const form = new URLSearchParams();
+  form.set('username', config.username);
+  form.set('password', config.password);
+  const response = await fetchNacosWithTimeout(`${config.serverUrl}${pathname}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8' },
+    body: form.toString(),
+  });
+  const payload = await readNacosPayload(response);
+  assertNacosSuccess(response, payload, `Nacos 登录失败: ${pathname}`);
+  return payload;
+}
+
+function extractNacosAccessToken(payload) {
+  return String(
+    payload?.data?.accessToken
+    || payload?.accessToken
+    || payload?.data
+    || ''
+  ).trim();
+}
+
+async function requestNacosAccessToken(config) {
+  if (!config.username && !config.password) return '';
+
+  const loginPaths = [
+    '/nacos/v3/auth/user/login',
+    '/nacos/v1/auth/login',
+  ];
+  const errors = [];
+  for (const pathname of loginPaths) {
+    try {
+      const payload = await requestNacosLogin(config, pathname);
+      const accessToken = extractNacosAccessToken(payload);
+      if (accessToken) return accessToken;
+      errors.push(`${pathname}: 未返回 accessToken`);
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  const accessToken = '';
+  if (!accessToken) {
+    throw new Error(`Nacos 登录失败，请检查用户名、密码和 OpenAPI 鉴权配置。${errors.join('；')}`);
+  }
+  return accessToken;
+}
+
+function parseNacosTextPayload(text) {
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function assertNacosConfigFetchSuccess(response, payload, text) {
+  const message = getNacosResponseMessage(payload) || text;
+  if (!response.ok) {
+    if (/access denied|authorization|forbidden|no permission/i.test(message)) {
+      throw new Error('Nacos 已开启鉴权，请填写 Nacos 用户名和密码后重试');
+    }
+    throw new Error(message || `Nacos 配置获取失败: HTTP ${response.status}`);
+  }
+  if (payload && typeof payload === 'object' && typeof payload.code === 'number' && payload.code !== 0) {
+    if (/access denied|authorization|forbidden|no permission/i.test(message)) {
+      throw new Error('Nacos 已开启鉴权，请填写 Nacos 用户名和密码后重试');
+    }
+    throw new Error(message || `Nacos 配置获取失败: code ${payload.code}`);
+  }
+}
+
+function extractNacosConfigContent(payload, text) {
+  if (payload && typeof payload === 'object') {
+    if (payload.data && typeof payload.data === 'object' && typeof payload.data.content === 'string') {
+      return payload.data.content;
+    }
+    if (typeof payload.content === 'string') {
+      return payload.content;
+    }
+    if (typeof payload.data === 'string') {
+      return payload.data;
+    }
+  }
+  if (typeof text === 'string' && text.trim()) {
+    return text;
+  }
+  throw new Error('Nacos 配置为空，请检查 Data ID、Group 和命名空间');
+}
+
+async function requestNacosConfig(config, pathname, accessToken) {
+  const url = new URL(`${config.serverUrl}${pathname}`);
+  url.searchParams.set('dataId', config.dataId);
+  url.searchParams.set('groupName', config.groupName);
+  url.searchParams.set('namespaceId', config.namespaceId);
+  if (accessToken) {
+    url.searchParams.set('accessToken', accessToken);
+  }
+
+  const response = await fetchNacosWithTimeout(url.toString(), {
+    method: 'GET',
+    headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : undefined,
+  });
+  const text = await response.text().catch(() => '');
+  const payload = parseNacosTextPayload(text);
+  assertNacosConfigFetchSuccess(response, payload, text);
+  return extractNacosConfigContent(payload, text);
+}
+
+async function fetchNacosConfig(config) {
+  const accessToken = await requestNacosAccessToken(config);
+  const configPaths = [
+    '/nacos/v3/client/cs/config',
+    '/nacos/v3/admin/cs/config',
+  ];
+  const errors = [];
+  let content = '';
+  for (const pathname of configPaths) {
+    try {
+      content = await requestNacosConfig(config, pathname, accessToken);
+      break;
+    } catch (error) {
+      errors.push(error instanceof Error ? `${pathname}: ${error.message}` : `${pathname}: ${String(error)}`);
+    }
+  }
+
+  if (!content) {
+    throw new Error(`Nacos 配置获取失败。${errors.join('；')}`);
+  }
+
+  return {
+    ok: true,
+    serverUrl: config.serverUrl,
+    namespaceId: config.namespaceId,
+    groupName: config.groupName,
+    dataId: config.dataId,
+    content,
+  };
+}
+
+function normalizeNacosRemoteConfigError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/No static resource|No endpoint|auth\/user\/login|auth\/login/i.test(message)) {
+    return 'Nacos OpenAPI 地址不通，请填写 Nacos Server 地址（通常是 8848 端口），不要填写只用于控制台页面的 /next 或 8080 代理地址';
+  }
+  if (/access denied|authorization|forbidden|no permission/i.test(message)) {
+    return 'Nacos 已开启鉴权，请填写 Nacos 用户名和密码后重试';
+  }
+  if (/abort|timeout|timed out/i.test(message)) {
+    return `Nacos 请求超时（${NACOS_CONFIG_TIMEOUT_MS / 1000}秒），请检查地址或网络`;
+  }
+  if (/failed to fetch|fetch failed|networkerror|network request failed|econnreset|socket hang up|terminated/i.test(message)) {
+    return '无法连接 Nacos，请检查域名/IP、端口和网络';
+  }
+  return message.length > 200 ? message.slice(0, 200) + '…' : message;
+}
+
 async function generateNovaImage(apiKey, request) {
   // 开源版：根据前端传入的 protocol 字段路由到对应的 API 协议
   const baseUrl = request.baseUrl || resolveNovaApiBaseUrl();
@@ -1537,6 +1783,22 @@ async function handleApi(req, res, pathname) {
       const password = String(body?.password || '');
       const ok = hashPromptGalleryPassword(password) === hashPromptGalleryPassword(expected);
       sendJson(res, 200, { ok });
+      return true;
+    }
+
+    if (req.method === 'POST' && apiPathname === '/api/nova/remote-config/nacos/fetch') {
+      try {
+        const body = await readJsonBody(req);
+        const payload = normalizeNacosConfigFetchPayload(body);
+        const result = await fetchNacosConfig(payload);
+        sendJson(res, 200, result);
+      } catch (error) {
+        if (isHttpError(error)) {
+          sendHttpError(res, error);
+        } else {
+          sendJson(res, 502, { error: normalizeNacosRemoteConfigError(error) });
+        }
+      }
       return true;
     }
 

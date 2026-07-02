@@ -16,13 +16,13 @@ import {
   Settings,
   Trash2,
   Upload,
-  Wand2,
   XCircle,
 } from 'lucide-react';
 import {
   Dialog,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
@@ -36,11 +36,8 @@ import {
   BUILTIN_IMAGE_PRESETS,
   BUILTIN_IMAGE_PRESET_OPTIONS,
   DEFAULT_DEFAULTS,
-  DEFAULT_TEXT_MODEL_TEMPLATES,
   generateModelId,
   getDefaultTextModelTemplate,
-  getCompleteImageModels,
-  getCompleteTextModels,
   getImageModelOutputSizes,
   loadRegistry,
   saveRegistry,
@@ -55,6 +52,12 @@ import { checkModelsAvailability, type ModelStatus } from '@/lib/ccode-task-clie
 import { hasAnyApiKey } from '@/lib/settings-storage';
 import { BA_RANDOM_URL, BING_WALLPAPER_URL } from '@/lib/constants';
 import { PROMPT_DATA_SOURCES, getPromptSourceLabel } from '@/lib/prompt-gallery-data';
+import {
+  DEFAULT_NACOS_DATA_ID,
+  DEFAULT_NACOS_GROUP_NAME,
+  DEFAULT_NACOS_NAMESPACE_ID,
+  fetchNacosModelRegistryConfig,
+} from '@/lib/remote-config-client';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -135,6 +138,14 @@ function normalizeDefaults(
   };
 }
 
+function createRegistryValidationError(imageModels: ImageModelConfig[], textModels: TextModelConfig[]): string | null {
+  if (imageModels.length === 0) return '至少填写一个图片模型';
+  if (textModels.length === 0) return '至少填写一个文本模型';
+  if (!imageModels.some(isCompleteImageModel)) return '至少完成一个图片模型的全部信息';
+  if (!textModels.some(isCompleteTextModel)) return '至少完成一个文本模型的全部信息';
+  return null;
+}
+
 export function SettingsModal({ isOpen, onClose, onApiKeyChange }: SettingsModalProps) {
   const [imageModels, setImageModels] = useState<ImageModelConfig[]>([]);
   const [textModels, setTextModels] = useState<TextModelConfig[]>([]);
@@ -148,6 +159,16 @@ export function SettingsModal({ isOpen, onClose, onApiKeyChange }: SettingsModal
   const [modelCheckError, setModelCheckError] = useState<string | null>(null);
   const [showImageApiKey, setShowImageApiKey] = useState(false);
   const [showTextApiKey, setShowTextApiKey] = useState(false);
+  const [remoteDialogOpen, setRemoteDialogOpen] = useState(false);
+  const [remoteServerUrl, setRemoteServerUrl] = useState('192.168.8.110:8848');
+  const [remoteNamespaceId, setRemoteNamespaceId] = useState(DEFAULT_NACOS_NAMESPACE_ID);
+  const [remoteGroupName, setRemoteGroupName] = useState(DEFAULT_NACOS_GROUP_NAME);
+  const [remoteDataId, setRemoteDataId] = useState(DEFAULT_NACOS_DATA_ID);
+  const [remoteUsername, setRemoteUsername] = useState('');
+  const [remotePassword, setRemotePassword] = useState('');
+  const [fetchingRemoteConfig, setFetchingRemoteConfig] = useState(false);
+  const [remoteError, setRemoteError] = useState<string | null>(null);
+  const [remoteSuccess, setRemoteSuccess] = useState<string | null>(null);
 
   const [backupProgress, setBackupProgress] = useState<BackupProgressType>({ percent: 0, message: '' });
   const [isBackupActive, setIsBackupActive] = useState(false);
@@ -167,6 +188,8 @@ export function SettingsModal({ isOpen, onClose, onApiKeyChange }: SettingsModal
     setSuccess(null);
     setModelStatuses(null);
     setModelCheckError(null);
+    setRemoteError(null);
+    setRemoteSuccess(null);
     setBackupError(null);
     setBackupSuccess(null);
   }, [isOpen]);
@@ -265,20 +288,9 @@ export function SettingsModal({ isOpen, onClose, onApiKeyChange }: SettingsModal
   };
 
   const persistRegistry = () => {
-    if (imageModels.length === 0) {
-      setError('至少填写一个图片模型');
-      return;
-    }
-    if (textModels.length === 0) {
-      setError('至少填写一个文本模型');
-      return;
-    }
-    if (!imageModels.some(isCompleteImageModel)) {
-      setError('至少完成一个图片模型的全部信息');
-      return;
-    }
-    if (!textModels.some(isCompleteTextModel)) {
-      setError('至少完成一个文本模型的全部信息');
+    const validationError = createRegistryValidationError(imageModels, textModels);
+    if (validationError) {
+      setError(validationError);
       return;
     }
 
@@ -296,6 +308,54 @@ export function SettingsModal({ isOpen, onClose, onApiKeyChange }: SettingsModal
     setError(null);
     setModelStatuses(null);
     setModelCheckError(null);
+  };
+
+  const handleOpenRemoteDialog = () => {
+    setRemoteError(null);
+    setRemoteSuccess(null);
+    setRemoteDialogOpen(true);
+  };
+
+  const handleFetchRemoteConfig = async () => {
+    setFetchingRemoteConfig(true);
+    setRemoteError(null);
+    setRemoteSuccess(null);
+    try {
+      const registry = await fetchNacosModelRegistryConfig({
+        serverUrl: remoteServerUrl,
+        namespaceId: remoteNamespaceId,
+        groupName: remoteGroupName,
+        dataId: remoteDataId,
+        username: remoteUsername,
+        password: remotePassword,
+      });
+      const normalizedDefaults = normalizeDefaults(registry.defaults, registry.imageModels, registry.textModels);
+      const nextRegistry = {
+        imageModels: registry.imageModels,
+        textModels: registry.textModels,
+        defaults: normalizedDefaults,
+      };
+
+      saveRegistry(nextRegistry);
+      syncDynamicModelExports();
+      window.dispatchEvent(new Event('nova-model-registry-updated'));
+      onApiKeyChange?.(hasAnyApiKey());
+
+      setImageModels(nextRegistry.imageModels.map(cloneImageModel));
+      setTextModels(nextRegistry.textModels.map(cloneTextModel));
+      setDefaults(normalizedDefaults);
+      setSelectedImageModelId(nextRegistry.imageModels[0]?.id || '');
+      setSelectedTextModelId(nextRegistry.textModels[0]?.id || '');
+      setModelStatuses(null);
+      setModelCheckError(null);
+      setRemoteSuccess(`已获取 ${remoteDataId || DEFAULT_NACOS_DATA_ID} 并保存到本地`);
+      setSuccess('远程配置已保存到本地');
+      setError(null);
+    } catch (err) {
+      setRemoteError(err instanceof Error ? err.message : '远程配置获取失败');
+    } finally {
+      setFetchingRemoteConfig(false);
+    }
   };
 
   const handleCheckModels = async () => {
@@ -407,10 +467,16 @@ export function SettingsModal({ isOpen, onClose, onApiKeyChange }: SettingsModal
                 <p className="text-sm font-medium">模型级独立配置</p>
                 <p className="text-xs text-muted-foreground">每个模型单独记录协议、Base URL、API Key。外部只显示配置完整的模型。</p>
               </div>
-              <Button onClick={persistRegistry} className="gap-2">
-                <Save className="w-4 h-4" />
-                保存设置
-              </Button>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button onClick={handleOpenRemoteDialog} variant="outline" className="gap-2">
+                  <Download className="w-4 h-4" />
+                  远程下发
+                </Button>
+                <Button onClick={persistRegistry} className="gap-2">
+                  <Save className="w-4 h-4" />
+                  保存设置
+                </Button>
+              </div>
             </div>
 
             {error && <div className="rounded-lg border border-destructive/20 bg-destructive/10 p-3 text-sm text-destructive">{error}</div>}
@@ -840,6 +906,80 @@ export function SettingsModal({ isOpen, onClose, onApiKeyChange }: SettingsModal
           </TabsContent>
         </Tabs>
       </DialogContent>
+
+      <Dialog open={remoteDialogOpen} onOpenChange={(open) => {
+        if (!open && fetchingRemoteConfig) return;
+        setRemoteDialogOpen(open);
+      }}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>获取远程配置</DialogTitle>
+            <DialogDescription>
+              输入 Nacos Server 域名或 IP，读取模型配置并保存到本地浏览器。
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <label className="text-xs text-muted-foreground">Nacos 域名或 IP</label>
+              <Input
+                value={remoteServerUrl}
+                onChange={(event) => setRemoteServerUrl(event.target.value)}
+                placeholder="192.168.8.110:8848 或 nacos.example.com"
+              />
+              <p className="text-xs text-muted-foreground">Nacos 3.x 控制台默认是 8080，Server OpenAPI 默认是 8848。</p>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-2">
+                <label className="text-xs text-muted-foreground">Namespace</label>
+                <Input
+                  value={remoteNamespaceId}
+                  onChange={(event) => setRemoteNamespaceId(event.target.value)}
+                  placeholder={DEFAULT_NACOS_NAMESPACE_ID}
+                />
+              </div>
+              <div className="space-y-2">
+                <label className="text-xs text-muted-foreground">Group</label>
+                <Input
+                  value={remoteGroupName}
+                  onChange={(event) => setRemoteGroupName(event.target.value)}
+                  placeholder={DEFAULT_NACOS_GROUP_NAME}
+                />
+              </div>
+            </div>
+            <div className="space-y-2">
+              <label className="text-xs text-muted-foreground">Data ID</label>
+              <Input
+                value={remoteDataId}
+                onChange={(event) => setRemoteDataId(event.target.value)}
+                placeholder={DEFAULT_NACOS_DATA_ID}
+              />
+            </div>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="space-y-2">
+                <label className="text-xs text-muted-foreground">用户名（可选）</label>
+                <Input value={remoteUsername} onChange={(event) => setRemoteUsername(event.target.value)} placeholder="开启鉴权时填写" />
+              </div>
+              <div className="space-y-2">
+                <label className="text-xs text-muted-foreground">密码（可选）</label>
+                <Input type="password" value={remotePassword} onChange={(event) => setRemotePassword(event.target.value)} placeholder="开启鉴权时填写" />
+              </div>
+            </div>
+            {remoteError && <div className="rounded-lg border border-destructive/20 bg-destructive/10 p-3 text-sm text-destructive">{remoteError}</div>}
+            {remoteSuccess && <div className="rounded-lg border border-emerald-500/20 bg-emerald-500/10 p-3 text-sm text-emerald-700 dark:text-emerald-400">{remoteSuccess}</div>}
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setRemoteDialogOpen(false)} disabled={fetchingRemoteConfig}>
+              取消
+            </Button>
+            <Button onClick={handleFetchRemoteConfig} disabled={fetchingRemoteConfig} className="gap-2">
+              <Download className="w-4 h-4" />
+              {fetchingRemoteConfig ? '获取中...' : '获取数据'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Dialog>
   );
 }

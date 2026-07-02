@@ -1,0 +1,15 @@
+services:
+  nova-image-studio:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: nova-image-studio:local
+    container_name: nova-image-studio
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/backend/data
+      - ./backend/blacklist.json:/app/backend/blacklist.json
+      - ./backend/prompts.json:/app/backend/prompts.json
+      - ./.env:/app/.env
+    restart: unless-stopped
