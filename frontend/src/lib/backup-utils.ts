@@ -1,6 +1,6 @@
 'use client';
 
-import { zipSync, unzipSync, strToU8 } from 'fflate';
+import { zip, unzipSync, strToU8 } from 'fflate';
 import localforage from 'localforage';
 
 export interface BackupProgress {
@@ -87,25 +87,63 @@ function jsonToU8(data: unknown): Uint8Array {
     return strToU8(JSON.stringify(data));
 }
 
+function yieldToMain(): Promise<void> {
+    return new Promise((resolve) => {
+        if (typeof requestAnimationFrame === 'function') {
+            requestAnimationFrame(() => resolve());
+            return;
+        }
+        setTimeout(resolve, 0);
+    });
+}
+
+function zipFiles(files: Record<string, Uint8Array>): Promise<Uint8Array> {
+    return new Promise((resolve, reject) => {
+        zip(files, { level: 6 }, (err, data) => {
+            if (err) {
+                reject(err);
+                return;
+            }
+            if (!data) {
+                reject(new Error('ZIP 文件生成失败'));
+                return;
+            }
+            resolve(data);
+        });
+    });
+}
+
 /**
  * 导出 localforage（keyless）store：保留 key；Blob 值以二进制存入 ZIP blobs/，JSON 内留引用。
  * 数据逐 store 写入 files 对象，释放引用后可被 GC 回收。
  */
-async function exportLocalForage(files: Record<string, Uint8Array>): Promise<LocalForageBackup> {
+async function exportLocalForage(files: Record<string, Uint8Array>, onProgress?: ProgressCallback): Promise<LocalForageBackup> {
     const result: LocalForageBackup = {};
     for (const cfg of LOCALFORAGE_STORES) {
         try {
             const instance = localforage.createInstance({ name: cfg.name, storeName: cfg.storeName });
             const entries: LocalForageEntry[] = [];
+            const pendingBlobs: { ref: string; blob: Blob }[] = [];
             await instance.iterate((value: unknown, key: string) => {
                 if (value instanceof Blob) {
                     const ref = nextBlobRef();
-                    blobToUint8(value).then(u8 => { files[`blobs/${ref}`] = u8; });
+                    pendingBlobs.push({ ref, blob: value });
                     entries.push({ key, _blobRef: ref, _blobMimeType: value.type });
                 } else {
                     entries.push({ key, value });
                 }
             });
+            for (let index = 0; index < pendingBlobs.length; index++) {
+                const item = pendingBlobs[index];
+                files[`blobs/${item.ref}`] = await blobToUint8(item.blob);
+                if (index % 10 === 0) {
+                    onProgress?.({
+                        percent: 92,
+                        message: `正在导出无限画布图片 ${cfg.storeName} (${index + 1}/${pendingBlobs.length})...`,
+                    });
+                    await yieldToMain();
+                }
+            }
             if (!result[cfg.name]) result[cfg.name] = {};
             result[cfg.name][cfg.storeName] = entries;
         } catch {
@@ -225,7 +263,12 @@ function openDatabase(name: string, version: number, createStores: boolean = fal
  * 导出单个 IndexedDB store 的所有数据
  * Blob 字段转为 Uint8Array 存入 files，JSON 中只保留引用
  */
-async function exportStore(db: IDBDatabase, storeName: string, files: Record<string, Uint8Array>): Promise<BackupRecord[]> {
+async function exportStore(
+    db: IDBDatabase,
+    storeName: string,
+    files: Record<string, Uint8Array>,
+    onRecordProgress?: (processed: number, total: number) => void,
+): Promise<BackupRecord[]> {
     return new Promise((resolve, reject) => {
         try {
             const transaction = db.transaction(storeName, 'readonly');
@@ -235,23 +278,27 @@ async function exportStore(db: IDBDatabase, storeName: string, files: Record<str
             request.onsuccess = async () => {
                 const records = request.result;
 
-                const processedRecords = await Promise.all(
-                    records.map(async (record) => {
-                        const processed = { ...record };
+                const processedRecords: BackupRecord[] = [];
 
-                        // 遍历所有字段，将 Blob 类型以二进制存入 files
-                        for (const key of Object.keys(processed)) {
-                            const val = processed[key];
-                            if (val instanceof Blob) {
-                                const ref = nextBlobRef();
-                                files[`blobs/${ref}`] = await blobToUint8(val);
-                                processed[key] = { _blobRef: ref, _blobMimeType: val.type };
-                            }
+                for (let index = 0; index < records.length; index++) {
+                    const processed = { ...records[index] };
+
+                    // 遍历所有字段，将 Blob 类型以二进制存入 files
+                    for (const key of Object.keys(processed)) {
+                        const val = processed[key];
+                        if (val instanceof Blob) {
+                            const ref = nextBlobRef();
+                            files[`blobs/${ref}`] = await blobToUint8(val);
+                            processed[key] = { _blobRef: ref, _blobMimeType: val.type };
                         }
+                    }
 
-                        return processed;
-                    })
-                );
+                    processedRecords.push(processed);
+                    if (index % 10 === 0 || index === records.length - 1) {
+                        onRecordProgress?.(index + 1, records.length);
+                        await yieldToMain();
+                    }
+                }
 
                 resolve(processedRecords);
             };
@@ -287,14 +334,27 @@ async function exportIndexedDB(files: Record<string, Uint8Array>, onProgress?: P
                     continue;
                 }
 
-                const storeData = await exportStore(db, storeName, files);
+                const startPercent = 10 + Math.floor((completedStores / totalStores) * 80);
+                const endPercent = 10 + Math.floor(((completedStores + 1) / totalStores) * 80);
+                onProgress?.({
+                    percent: startPercent,
+                    message: `正在导出 ${dbConfig.name}/${storeName}...`,
+                });
+
+                const storeData = await exportStore(db, storeName, files, (processed, total) => {
+                    const ratio = total > 0 ? processed / total : 1;
+                    const percent = Math.min(endPercent - 1, startPercent + Math.floor((endPercent - startPercent) * ratio));
+                    onProgress?.({
+                        percent,
+                        message: `正在导出 ${dbConfig.name}/${storeName} (${processed}/${total})...`,
+                    });
+                });
                 dbData[storeName] = storeData;
 
                 completedStores++;
                 if (onProgress) {
-                    const percent = 10 + Math.floor((completedStores / totalStores) * 80);
                     onProgress({
-                        percent,
+                        percent: endPercent,
                         message: `正在导出 ${dbConfig.name}/${storeName}...`,
                     });
                 }
@@ -330,7 +390,7 @@ export async function exportAllData(onProgress?: ProgressCallback): Promise<Blob
     const indexedDBData = await exportIndexedDB(files, onProgress);
 
     // 导出 localforage 数据
-    const localForageData = await exportLocalForage(files);
+    const localForageData = await exportLocalForage(files, onProgress);
 
     // 打包元数据和 localStorage JSON
     if (onProgress) {
@@ -361,9 +421,13 @@ export async function exportAllData(onProgress?: ProgressCallback): Promise<Blob
         onProgress({ percent: 95, message: '正在生成 ZIP 文件...' });
     }
 
-    // 使用 fflate 同步压缩（比 JSZip 快 10-20 倍，内存占用更低）
-    const zipped = zipSync(files, { level: 6 });
-    const blob = new Blob([zipped], { type: 'application/zip' });
+    await yieldToMain();
+
+    // 使用 fflate 异步压缩，避免大备份文件长时间阻塞浏览器主线程。
+    const zipped = await zipFiles(files);
+    const zippedBuffer = new ArrayBuffer(zipped.byteLength);
+    new Uint8Array(zippedBuffer).set(zipped);
+    const blob = new Blob([zippedBuffer], { type: 'application/zip' });
 
     if (onProgress) {
         onProgress({ percent: 100, message: '导出完成！' });
