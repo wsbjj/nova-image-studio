@@ -1,0 +1,4 @@
+https://192.168.8.110 {
+	tls internal
+	reverse_proxy nova-image-studio:3000
+}

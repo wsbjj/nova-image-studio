@@ -13,3 +13,20 @@ services:
       - ./backend/prompts.json:/app/backend/prompts.json
       - ./.env:/app/.env
     restart: unless-stopped
+
+  nova-image-studio-https:
+    image: caddy:2-alpine
+    container_name: nova-image-studio-https
+    depends_on:
+      - nova-image-studio
+    ports:
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:
