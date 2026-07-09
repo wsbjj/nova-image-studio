@@ -1,6 +1,6 @@
 'use client';
 
-import { zip, unzipSync, strToU8 } from 'fflate';
+import { Zip, ZipPassThrough, unzipSync, strToU8 } from 'fflate';
 import localforage from 'localforage';
 
 export interface BackupProgress {
@@ -68,12 +68,6 @@ const LOCALFORAGE_STORES: { name: string; storeName: string }[] = [
 type LocalForageEntry = { key: string; value: unknown } | { key: string; _blobRef: string; _blobMimeType: string };
 type LocalForageBackup = Record<string, Record<string, LocalForageEntry[]>>;
 
-/** Blob → Uint8Array（fflate 需要 Uint8Array） */
-async function blobToUint8(blob: Blob): Promise<Uint8Array> {
-    const ab = await blob.arrayBuffer();
-    return new Uint8Array(ab);
-}
-
 // 用于生成导出时 Blob 的唯一引用 ID
 let _blobRefSeq = 0;
 function nextBlobRef(): string {
@@ -97,27 +91,91 @@ function yieldToMain(): Promise<void> {
     });
 }
 
-function zipFiles(files: Record<string, Uint8Array>): Promise<Uint8Array> {
-    return new Promise((resolve, reject) => {
-        zip(files, { level: 6 }, (err, data) => {
-            if (err) {
-                reject(err);
-                return;
-            }
-            if (!data) {
-                reject(new Error('ZIP 文件生成失败'));
-                return;
-            }
-            resolve(data);
+class StreamingZipWriter {
+    private readonly zip: Zip;
+    private readonly chunks: BlobPart[] = [];
+    private readonly done: Promise<void>;
+    private resolveDone: (() => void) | null = null;
+    private rejectDone: ((error: Error) => void) | null = null;
+    private failed = false;
+
+    constructor() {
+        this.done = new Promise((resolve, reject) => {
+            this.resolveDone = resolve;
+            this.rejectDone = reject;
         });
-    });
+        this.zip = new Zip((err, chunk, final) => {
+            if (err) {
+                this.failed = true;
+                this.rejectDone?.(err);
+                return;
+            }
+            if (chunk) {
+                this.chunks.push(chunk);
+            }
+            if (final) {
+                this.resolveDone?.();
+            }
+        });
+    }
+
+    addBytes(path: string, bytes: Uint8Array): void {
+        if (this.failed) return;
+        const file = new ZipPassThrough(path);
+        this.zip.add(file);
+        file.push(bytes, true);
+    }
+
+    addJson(path: string, data: unknown): void {
+        this.addBytes(path, jsonToU8(data));
+    }
+
+    async addBlob(path: string, blob: Blob): Promise<void> {
+        if (this.failed) return;
+        const file = new ZipPassThrough(path);
+        this.zip.add(file);
+
+        if (typeof blob.stream === 'function') {
+            const reader = blob.stream().getReader();
+            let chunksRead = 0;
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    if (value) {
+                        file.push(value, false);
+                        chunksRead++;
+                        if (chunksRead % 16 === 0) {
+                            await yieldToMain();
+                        }
+                    }
+                }
+                file.push(new Uint8Array(0), true);
+            } finally {
+                reader.releaseLock();
+            }
+            return;
+        }
+
+        const buffer = await blob.arrayBuffer();
+        file.push(new Uint8Array(buffer), true);
+    }
+
+    async finalize(): Promise<Blob> {
+        if (this.failed) {
+            await this.done;
+        }
+        this.zip.end();
+        await this.done;
+        return new Blob(this.chunks, { type: 'application/zip' });
+    }
 }
 
 /**
  * 导出 localforage（keyless）store：保留 key；Blob 值以二进制存入 ZIP blobs/，JSON 内留引用。
  * 数据逐 store 写入 files 对象，释放引用后可被 GC 回收。
  */
-async function exportLocalForage(files: Record<string, Uint8Array>, onProgress?: ProgressCallback): Promise<LocalForageBackup> {
+async function exportLocalForage(writer: StreamingZipWriter, onProgress?: ProgressCallback): Promise<LocalForageBackup> {
     const result: LocalForageBackup = {};
     for (const cfg of LOCALFORAGE_STORES) {
         try {
@@ -135,7 +193,7 @@ async function exportLocalForage(files: Record<string, Uint8Array>, onProgress?:
             });
             for (let index = 0; index < pendingBlobs.length; index++) {
                 const item = pendingBlobs[index];
-                files[`blobs/${item.ref}`] = await blobToUint8(item.blob);
+                await writer.addBlob(`blobs/${item.ref}`, item.blob);
                 if (index % 10 === 0) {
                     onProgress?.({
                         percent: 92,
@@ -266,7 +324,7 @@ function openDatabase(name: string, version: number, createStores: boolean = fal
 async function exportStore(
     db: IDBDatabase,
     storeName: string,
-    files: Record<string, Uint8Array>,
+    writer: StreamingZipWriter,
     onRecordProgress?: (processed: number, total: number) => void,
 ): Promise<BackupRecord[]> {
     return new Promise((resolve, reject) => {
@@ -288,7 +346,7 @@ async function exportStore(
                         const val = processed[key];
                         if (val instanceof Blob) {
                             const ref = nextBlobRef();
-                            files[`blobs/${ref}`] = await blobToUint8(val);
+                            await writer.addBlob(`blobs/${ref}`, val);
                             processed[key] = { _blobRef: ref, _blobMimeType: val.type };
                         }
                     }
@@ -314,7 +372,7 @@ async function exportStore(
  * 导出所有 IndexedDB 数据
  * 逐数据库、逐 store 顺序处理，处理完立即写入 files，降低内存峰值
  */
-async function exportIndexedDB(files: Record<string, Uint8Array>, onProgress?: ProgressCallback): Promise<IndexedDBBackup> {
+async function exportIndexedDB(writer: StreamingZipWriter, onProgress?: ProgressCallback): Promise<IndexedDBBackup> {
     const allData: IndexedDBBackup = {};
     let completedStores = 0;
     const totalStores = INDEXEDDB_DATABASES.reduce((sum, db) => sum + db.stores.length, 0);
@@ -341,7 +399,7 @@ async function exportIndexedDB(files: Record<string, Uint8Array>, onProgress?: P
                     message: `正在导出 ${dbConfig.name}/${storeName}...`,
                 });
 
-                const storeData = await exportStore(db, storeName, files, (processed, total) => {
+                const storeData = await exportStore(db, storeName, writer, (processed, total) => {
                     const ratio = total > 0 ? processed / total : 1;
                     const percent = Math.min(endPercent - 1, startPercent + Math.floor((endPercent - startPercent) * ratio));
                     onProgress?.({
@@ -385,12 +443,13 @@ export async function exportAllData(onProgress?: ProgressCallback): Promise<Blob
     }
     const localStorageData = exportLocalStorage();
 
-    // 逐 store 导出 IndexedDB，Blob 数据直接转为 Uint8Array 存入 files
-    const files: Record<string, Uint8Array> = {};
-    const indexedDBData = await exportIndexedDB(files, onProgress);
+    const writer = new StreamingZipWriter();
+
+    // 逐 store 导出 IndexedDB，Blob 数据直接流式写入 ZIP。
+    const indexedDBData = await exportIndexedDB(writer, onProgress);
 
     // 导出 localforage 数据
-    const localForageData = await exportLocalForage(files, onProgress);
+    const localForageData = await exportLocalForage(writer, onProgress);
 
     // 打包元数据和 localStorage JSON
     if (onProgress) {
@@ -398,23 +457,23 @@ export async function exportAllData(onProgress?: ProgressCallback): Promise<Blob
     }
 
     // 添加元数据
-    files['metadata.json'] = jsonToU8({
+    writer.addJson('metadata.json', {
         version: process.env.NEXT_PUBLIC_APP_VERSION || '0.0.0',
         exportDate: new Date().toISOString(),
         appName: 'Nova Image',
     });
 
     // 添加 localStorage 数据
-    files['localStorage.json'] = jsonToU8(localStorageData);
+    writer.addJson('localStorage.json', localStorageData);
 
     // 添加 IndexedDB 数据
     for (const [dbName, dbData] of Object.entries(indexedDBData)) {
-        files[`indexedDB/${dbName}.json`] = jsonToU8(dbData);
+        writer.addJson(`indexedDB/${dbName}.json`, dbData);
     }
 
     // 添加 localforage（无限画布）数据
     for (const [dbName, dbData] of Object.entries(localForageData)) {
-        files[`localforage/${dbName}.json`] = jsonToU8(dbData);
+        writer.addJson(`localforage/${dbName}.json`, dbData);
     }
 
     if (onProgress) {
@@ -423,11 +482,7 @@ export async function exportAllData(onProgress?: ProgressCallback): Promise<Blob
 
     await yieldToMain();
 
-    // 使用 fflate 异步压缩，避免大备份文件长时间阻塞浏览器主线程。
-    const zipped = await zipFiles(files);
-    const zippedBuffer = new ArrayBuffer(zipped.byteLength);
-    new Uint8Array(zippedBuffer).set(zipped);
-    const blob = new Blob([zippedBuffer], { type: 'application/zip' });
+    const blob = await writer.finalize();
 
     if (onProgress) {
         onProgress({ percent: 100, message: '导出完成！' });
