@@ -398,7 +398,7 @@ export function SettingsModal({ isOpen, onClose, onApiKeyChange }: SettingsModal
   };
 
   const handleImport = async (file: File) => {
-    if (!file.name.endsWith('.zip')) {
+    if (!file.name.toLowerCase().endsWith('.zip')) {
       setBackupError('请选择有效的备份文件（.zip 格式）');
       return;
     }
@@ -418,8 +418,11 @@ export function SettingsModal({ isOpen, onClose, onApiKeyChange }: SettingsModal
 
   const handleFileSelect = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
-    if (file) handleImport(file);
-    if (fileInputRef.current) fileInputRef.current.value = '';
+    if (!file) return;
+
+    void handleImport(file).finally(() => {
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    });
   };
 
   const completeImageOptions = imageModels.filter(isCompleteImageModel).map((model) => ({ value: model.id, label: model.name }));

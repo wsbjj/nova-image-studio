@@ -671,12 +671,27 @@ export async function importAllData(file: File, onProgress?: ProgressCallback): 
         onProgress({ percent: 0, message: '开始导入数据...' });
     }
 
-    // 解压 ZIP 文件
+    // 读取 ZIP 文件
     if (onProgress) {
-        onProgress({ percent: 5, message: '正在解压文件...' });
+        onProgress({ percent: 5, message: '正在读取备份文件...' });
     }
 
-    const buffer = await file.arrayBuffer();
+    let buffer: ArrayBuffer;
+    try {
+        buffer = await file.arrayBuffer();
+    } catch (error) {
+        const message = error instanceof Error ? error.message : '';
+        const name = error instanceof DOMException ? error.name : '';
+        if (name === 'NotReadableError' || message.includes('requested file could not be read')) {
+            throw new Error('无法读取备份文件。请确认 ZIP 已下载完成，并把它复制到本机普通目录（例如“下载”或“桌面”）后重新选择，不要从浏览器临时下载项、网盘同步目录或已移动/删除的位置导入。');
+        }
+        throw error;
+    }
+
+    if (onProgress) {
+        onProgress({ percent: 8, message: '正在解压文件...' });
+    }
+
     const unzipped = unzipSync(new Uint8Array(buffer));
 
     // 辅助：从解压结果读取文本
