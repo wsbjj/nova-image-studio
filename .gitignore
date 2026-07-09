@@ -21,6 +21,7 @@ out.zip
 # misc
 .DS_Store
 *.pem
+caddy-local-root.crt
 
 # database & images (backend)
 backend/nova-tasks.sqlite*
