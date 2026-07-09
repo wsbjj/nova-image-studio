@@ -1,7 +1,12 @@
 'use client';
 
-import { Zip, ZipPassThrough, unzipSync, strToU8 } from 'fflate';
 import localforage from 'localforage';
+import {
+    BlobZipArchive,
+    StreamingZipWriter,
+    normalizeBackupArchiveError,
+    type BackupArchiveReader,
+} from './backup-archive';
 
 export interface BackupProgress {
     percent: number;
@@ -74,13 +79,6 @@ function nextBlobRef(): string {
     return `b${Date.now()}_${++_blobRefSeq}`;
 }
 
-/**
- * 将 JSON 数据转为 fflate 可用的 Uint8Array
- */
-function jsonToU8(data: unknown): Uint8Array {
-    return strToU8(JSON.stringify(data));
-}
-
 function yieldToMain(): Promise<void> {
     return new Promise((resolve) => {
         if (typeof requestAnimationFrame === 'function') {
@@ -89,86 +87,6 @@ function yieldToMain(): Promise<void> {
         }
         setTimeout(resolve, 0);
     });
-}
-
-class StreamingZipWriter {
-    private readonly zip: Zip;
-    private readonly chunks: BlobPart[] = [];
-    private readonly done: Promise<void>;
-    private resolveDone: (() => void) | null = null;
-    private rejectDone: ((error: Error) => void) | null = null;
-    private failed = false;
-
-    constructor() {
-        this.done = new Promise((resolve, reject) => {
-            this.resolveDone = resolve;
-            this.rejectDone = reject;
-        });
-        this.zip = new Zip((err, chunk, final) => {
-            if (err) {
-                this.failed = true;
-                this.rejectDone?.(err);
-                return;
-            }
-            if (chunk) {
-                this.chunks.push(chunk);
-            }
-            if (final) {
-                this.resolveDone?.();
-            }
-        });
-    }
-
-    addBytes(path: string, bytes: Uint8Array): void {
-        if (this.failed) return;
-        const file = new ZipPassThrough(path);
-        this.zip.add(file);
-        file.push(bytes, true);
-    }
-
-    addJson(path: string, data: unknown): void {
-        this.addBytes(path, jsonToU8(data));
-    }
-
-    async addBlob(path: string, blob: Blob): Promise<void> {
-        if (this.failed) return;
-        const file = new ZipPassThrough(path);
-        this.zip.add(file);
-
-        if (typeof blob.stream === 'function') {
-            const reader = blob.stream().getReader();
-            let chunksRead = 0;
-            try {
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    if (value) {
-                        file.push(value, false);
-                        chunksRead++;
-                        if (chunksRead % 16 === 0) {
-                            await yieldToMain();
-                        }
-                    }
-                }
-                file.push(new Uint8Array(0), true);
-            } finally {
-                reader.releaseLock();
-            }
-            return;
-        }
-
-        const buffer = await blob.arrayBuffer();
-        file.push(new Uint8Array(buffer), true);
-    }
-
-    async finalize(): Promise<Blob> {
-        if (this.failed) {
-            await this.done;
-        }
-        this.zip.end();
-        await this.done;
-        return new Blob(this.chunks, { type: 'application/zip' });
-    }
 }
 
 /**
@@ -214,7 +132,7 @@ async function exportLocalForage(writer: StreamingZipWriter, onProgress?: Progre
 /**
  * 导入 localforage（keyless）store：先清空，再按 key 写回；Blob 从 ZIP 还原。
  */
-async function importLocalForage(data: LocalForageBackup, unzipped: Record<string, Uint8Array>): Promise<void> {
+async function importLocalForage(data: LocalForageBackup, archive: BackupArchiveReader): Promise<void> {
     for (const cfg of LOCALFORAGE_STORES) {
         const entries = data[cfg.name]?.[cfg.storeName];
         if (!Array.isArray(entries)) continue;
@@ -224,9 +142,9 @@ async function importLocalForage(data: LocalForageBackup, unzipped: Record<strin
             for (const entry of entries) {
                 let value: unknown;
                 if ('_blobRef' in entry && typeof entry._blobRef === 'string') {
-                    const blobData = unzipped[`blobs/${entry._blobRef}`];
-                    if (!blobData) continue;
-                    value = new Blob([blobData as unknown as BlobPart], { type: entry._blobMimeType });
+                    const blob = await archive.readBlob(`blobs/${entry._blobRef}`, entry._blobMimeType);
+                    if (!blob) continue;
+                    value = blob;
                 } else {
                     value = (entry as { value: unknown }).value;
                 }
@@ -430,7 +348,7 @@ async function exportIndexedDB(writer: StreamingZipWriter, onProgress?: Progress
 
 /**
  * 导出所有数据为 ZIP 文件
- * 使用 fflate 替代 JSZip，显著降低内存占用和处理时间
+ * 使用 ZIP64 流式写入，避免大备份在浏览器内生成超大 ArrayBuffer。
  */
 export async function exportAllData(onProgress?: ProgressCallback): Promise<Blob> {
     if (onProgress) {
@@ -563,49 +481,41 @@ async function deleteDatabase(name: string): Promise<void> {
 /**
  * 导入单个 store 的数据
  */
-async function importStore(db: IDBDatabase, storeName: string, records: BackupRecord[], unzipped: Record<string, Uint8Array>): Promise<void> {
-    // 先异步预处理记录：从解压数据提取二进制 / base64 解码
-    const processedRecords = await Promise.all(
-        records.map(async (record) => {
-            const processed: BackupRecord = { ...record };
+async function hydrateRecord(record: BackupRecord, archive: BackupArchiveReader): Promise<BackupRecord> {
+    const processed: BackupRecord = { ...record };
 
-            for (const key of Object.keys(processed)) {
-                const val = processed[key];
+    for (const key of Object.keys(processed)) {
+        const val = processed[key];
 
-                // 新格式：_blobRef 对象 → 从解压数据恢复 Blob
-                if (isBlobRef(val)) {
-                    const blobData = unzipped[`blobs/${val._blobRef}`];
-                    if (blobData) {
-                        processed[key] = new Blob([blobData as unknown as BlobPart], { type: val._blobMimeType });
-                    }
-                    continue;
-                }
-
-                // 旧格式兼容：base64 字符串 + _blobMimeType
-                if (key === 'blob' && typeof val === 'string' && typeof record._blobMimeType === 'string') {
-                    processed.blob = base64ToBlob(val, record._blobMimeType);
-                }
+        // 新格式：_blobRef 对象 → 从 ZIP 条目按需恢复 Blob
+        if (isBlobRef(val)) {
+            const blob = await archive.readBlob(`blobs/${val._blobRef}`, val._blobMimeType);
+            if (blob) {
+                processed[key] = blob;
             }
+            continue;
+        }
 
-            // 清理旧格式遗留的 _blobMimeType（新格式按字段内嵌携带）
-            if ('_blobMimeType' in processed && typeof processed._blobMimeType === 'string') {
-                delete processed._blobMimeType;
-            }
+        // 旧格式兼容：base64 字符串 + _blobMimeType
+        if (key === 'blob' && typeof val === 'string' && typeof record._blobMimeType === 'string') {
+            processed.blob = base64ToBlob(val, record._blobMimeType);
+        }
+    }
 
-            return processed;
-        })
-    );
+    // 清理旧格式遗留的 _blobMimeType（新格式按字段内嵌携带）
+    if ('_blobMimeType' in processed && typeof processed._blobMimeType === 'string') {
+        delete processed._blobMimeType;
+    }
 
-    // 再写回 IndexedDB
+    return processed;
+}
+
+async function putRecord(db: IDBDatabase, storeName: string, record: BackupRecord): Promise<void> {
     return new Promise((resolve, reject) => {
         try {
             const transaction = db.transaction(storeName, 'readwrite');
             const store = transaction.objectStore(storeName);
-
-            for (const processedRecord of processedRecords) {
-                store.put(processedRecord);
-            }
-
+            store.put(record);
             transaction.oncomplete = () => resolve();
             transaction.onerror = () => reject(transaction.error);
         } catch (error) {
@@ -614,10 +524,20 @@ async function importStore(db: IDBDatabase, storeName: string, records: BackupRe
     });
 }
 
+async function importStore(db: IDBDatabase, storeName: string, records: BackupRecord[], archive: BackupArchiveReader): Promise<void> {
+    for (let index = 0; index < records.length; index++) {
+        const processed = await hydrateRecord(records[index], archive);
+        await putRecord(db, storeName, processed);
+        if (index % 10 === 0) {
+            await yieldToMain();
+        }
+    }
+}
+
 /**
  * 导入 IndexedDB 数据
  */
-async function importIndexedDB(data: IndexedDBBackup, unzipped: Record<string, Uint8Array>, onProgress?: ProgressCallback): Promise<void> {
+async function importIndexedDB(data: IndexedDBBackup, archive: BackupArchiveReader, onProgress?: ProgressCallback): Promise<void> {
     let completedStores = 0;
     const totalStores = Object.values(data).reduce((sum, dbData) => sum + Object.keys(dbData).length, 0);
 
@@ -643,7 +563,7 @@ async function importIndexedDB(data: IndexedDBBackup, unzipped: Record<string, U
                     continue;
                 }
 
-                await importStore(db, storeName, storeData, unzipped);
+                await importStore(db, storeName, storeData, archive);
 
                 completedStores++;
                 if (onProgress) {
@@ -664,43 +584,29 @@ async function importIndexedDB(data: IndexedDBBackup, unzipped: Record<string, U
 
 /**
  * 从 ZIP 文件导入所有数据（覆盖现有数据）
- * 使用 fflate 解压，兼容新版和旧版（JSZip 生成的）备份格式
+ * 按 ZIP 中央目录读取条目，兼容 ZIP64 和旧版 JSZip 备份，避免一次性读入整个备份文件。
  */
 export async function importAllData(file: File, onProgress?: ProgressCallback): Promise<void> {
     if (onProgress) {
         onProgress({ percent: 0, message: '开始导入数据...' });
     }
 
-    // 读取 ZIP 文件
     if (onProgress) {
-        onProgress({ percent: 5, message: '正在读取备份文件...' });
+        onProgress({ percent: 5, message: '正在解析备份文件...' });
     }
 
-    let buffer: ArrayBuffer;
+    let archive: BlobZipArchive;
     try {
-        buffer = await file.arrayBuffer();
+        archive = await BlobZipArchive.open(file);
     } catch (error) {
-        const message = error instanceof Error ? error.message : '';
-        const name = error instanceof DOMException ? error.name : '';
-        if (name === 'NotReadableError' || message.includes('requested file could not be read')) {
-            throw new Error('无法读取备份文件。请确认 ZIP 已下载完成，并把它复制到本机普通目录（例如“下载”或“桌面”）后重新选择，不要从浏览器临时下载项、网盘同步目录或已移动/删除的位置导入。');
-        }
-        throw error;
+        throw normalizeBackupArchiveError(error);
     }
 
     if (onProgress) {
-        onProgress({ percent: 8, message: '正在解压文件...' });
+        onProgress({ percent: 8, message: '正在读取备份索引...' });
     }
 
-    const unzipped = unzipSync(new Uint8Array(buffer));
-
-    // 辅助：从解压结果读取文本
-    const readText = (path: string): string | null => {
-        const data = unzipped[path];
-        return data ? new TextDecoder().decode(data) : null;
-    };
-
-    const metadataText = readText('metadata.json');
+    const metadataText = await archive.readText('metadata.json');
     if (metadataText) {
         const metadata = JSON.parse(metadataText) as Record<string, unknown>;
         if (metadata.incremental === true) {
@@ -726,7 +632,7 @@ export async function importAllData(file: File, onProgress?: ProgressCallback): 
         onProgress({ percent: 15, message: '正在导入 localStorage...' });
     }
 
-    const localStorageText = readText('localStorage.json');
+    const localStorageText = await archive.readText('localStorage.json');
     if (localStorageText) {
         const localStorageData = JSON.parse(localStorageText);
         importLocalStorage(localStorageData);
@@ -734,28 +640,26 @@ export async function importAllData(file: File, onProgress?: ProgressCallback): 
 
     // 读取 IndexedDB 数据
     const indexedDBData: IndexedDBBackup = {};
-    for (const [path, data] of Object.entries(unzipped)) {
-        if (path.startsWith('indexedDB/') && path.endsWith('.json')) {
-            const dbName = path.replace('indexedDB/', '').replace('.json', '');
-            indexedDBData[dbName] = JSON.parse(new TextDecoder().decode(data));
-        }
+    for (const path of archive.list('indexedDB/', '.json')) {
+        const dbName = path.replace('indexedDB/', '').replace('.json', '');
+        const text = await archive.readText(path);
+        if (text) indexedDBData[dbName] = JSON.parse(text);
     }
 
     // 导入 IndexedDB
-    await importIndexedDB(indexedDBData, unzipped, onProgress);
+    await importIndexedDB(indexedDBData, archive, onProgress);
 
     // 读取并导入 localforage（无限画布）数据
     if (onProgress) {
         onProgress({ percent: 92, message: '正在导入无限画布数据...' });
     }
     const localForageData: LocalForageBackup = {};
-    for (const [path, data] of Object.entries(unzipped)) {
-        if (path.startsWith('localforage/') && path.endsWith('.json')) {
-            const dbName = path.replace('localforage/', '').replace('.json', '');
-            localForageData[dbName] = JSON.parse(new TextDecoder().decode(data));
-        }
+    for (const path of archive.list('localforage/', '.json')) {
+        const dbName = path.replace('localforage/', '').replace('.json', '');
+        const text = await archive.readText(path);
+        if (text) localForageData[dbName] = JSON.parse(text);
     }
-    await importLocalForage(localForageData, unzipped);
+    await importLocalForage(localForageData, archive);
 
     if (onProgress) {
         onProgress({ percent: 100, message: '导入完成！' });
