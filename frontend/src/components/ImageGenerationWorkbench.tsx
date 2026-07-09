@@ -81,6 +81,7 @@ interface ImageGenerationWorkbenchProps {
   referenceDraft?: {
     id: number;
     refImages: RefImageData[];
+    prompt?: string;
   } | null;
 }
 
@@ -276,6 +277,9 @@ export function ImageGenerationWorkbench({
     if (!referenceDraft?.refImages.length) return;
     if (consumedDraftRef.current === referenceDraft.id) return;
     consumedDraftRef.current = referenceDraft.id;
+    if (referenceDraft.prompt) {
+      setPrompt(referenceDraft.prompt);
+    }
     setPendingFiles(prev => {
       const existingIds = new Set(prev.map(file => file.id));
       const remainingSlots = Math.max(0, maxImages - prev.length);
