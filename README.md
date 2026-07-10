@@ -4,7 +4,10 @@
 
 **自托管的 AI 图像生成工作台 · 自定义模型 · 多模式 · PWA · 实时任务**
 
-[![Version](https://img.shields.io/badge/version-v3.1.2-blue.svg)](https://github.com)
+**dev 增强：Nacos 远程模型配置 · ZIP64 流式大备份 · Docker 开发预览 · 局域网 HTTPS**
+
+[![Version](https://img.shields.io/badge/version-v3.1.2-blue.svg)](https://github.com/wsbjj/nova-image-studio/tree/dev)
+[![Branch](https://img.shields.io/badge/branch-dev-orange.svg)](https://github.com/wsbjj/nova-image-studio/tree/dev)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)
 [![Next.js](https://img.shields.io/badge/Next.js-16-black.svg)](https://nextjs.org)
@@ -18,6 +21,8 @@
 
 Nova Image Studio（简称 Nova Image）是一个面向个人/团队的 AI 图像生成工作台。前端使用 Next.js 16 + React 19 静态导出（PWA），后端是轻量 Node.js 服务（`server.js` + SQLite + WebSocket），统一调度任务并代理图像生成 API。
 
+本仓库的默认分支 `dev` 基于 [tianjiangqiji/nova-image-studio](https://github.com/tianjiangqiji/nova-image-studio) `v3.1.2` 持续增强，在保留原有生成工作台、Agent、无限画布和提示词广场的基础上，重点补齐团队模型配置、大数据备份、本机开发与局域网部署链路。
+
 **开源版特性：**
 - 支持分别配置图片模型与文本模型，模型级独立保存 API Key 与 Base URL
 - 用户自定义模型列表和 API 端点，后端按协议路由并透传已配置参数
@@ -25,6 +30,20 @@ Nova Image Studio（简称 Nova Image）是一个面向个人/团队的 AI 图�
 - 文字模型支持 Google（generateContent）和 OpenAI（Response 协议）
 
 > 当前版本：**v3.1.2**
+
+## 🧭 dev 分支改动与优化
+
+以下内容为 `dev` 相对本仓库 `main` 的已实现增强，当前 GitHub 默认分支也是 `dev`。
+
+| 方向 | 实现改动 | 优化效果 |
+| --- | --- | --- |
+| Nacos 远程模型配置 | 设置页新增“远程下发”，通过后端代理读取 Nacos 3.x 模型配置，支持 Namespace、Group、Data ID 与可选账号密码 | 团队可集中维护图片模型、文本模型和默认模型；浏览器无需直接跨域访问 Nacos，拉取后仍落到本地配置 |
+| 大体积完整备份 | 新增流式 ZIP/ZIP64 写入器和按中央目录读取的归档解析器，兼容旧版 JSZip 备份及历史 4GB 偏移回绕归档 | 不再对整个备份执行 `file.arrayBuffer()` 或一次性解压，降低内存峰值，支持超过 4GB 的完整备份导入导出 |
+| 备份交互性能 | IndexedDB / localforage 按库、Store、记录分批处理，二进制按条目写入，并定期让出主线程和更新进度 | 大量历史图片和画布素材备份时页面更少卡顿，进度更清晰，失败定位更准确 |
+| Docker 开发预览 | 新增 `Dockerfile.dev` 与 `docker-compose.dev.yml`，源码 bind mount、依赖独立 volume，并修复 Next.js dev handler 对原始 URL 的处理 | 一条命令启动前端 HMR、后端 API 与 WebSocket，避免宿主机 Node 原生依赖差异 |
+| 当前源码部署与 LAN HTTPS | 新增 `docker-compose.prod.yml`、`deploy.env` 和 Caddy 内部 CA 反向代理，补充默认 SNI | 可直接构建当前 `dev` 源码部署，并在局域网通过 HTTPS 使用 PWA、剪贴板等安全上下文能力 |
+
+> “远程下发”当前是客户端从 Nacos **拉取**模型注册表并保存到浏览器，不会把本地配置反向发布到 Nacos，也不会同步任务历史、图片或画布数据。
 
 ## 💎 赞助商
 
@@ -97,6 +116,22 @@ Nova Image 采用**用户自定义模型**架构：
 - **Image 2 额外参数**：仅 OpenAI 图片模型显示，透明背景、质量、风格控件默认开启，用户可手动关闭
 - **文字模型**：支持自定义扩展，兼容 Gemini 和 OpenAI Response
 - **默认模型**：可为文本生图、图生图、反推提示词、Agent 等任务分别设置默认模型
+- **Nacos 配置拉取**：通过“设置 → 模型 → 远程下发”读取统一模型注册表，默认使用 `public` / `DEFAULT_GROUP` / `nova-image-studio-model-registry.json`
+
+Nacos 配置内容至少需要包含以下字段：
+
+```json
+{
+  "schema": "nova-image-studio.model-registry.v1",
+  "imageModels": [],
+  "textModels": [],
+  "defaults": {}
+}
+```
+
+后端会优先尝试 Nacos 3.x Client/Admin OpenAPI；开启鉴权时可在弹窗填写用户名和密码。成功拉取后会校验配置结构、补齐缺省项并保存到浏览器 `localStorage`。
+
+> 模型注册表可能包含 API Key。请限制 Nacos Namespace / Group 的读取权限，公网访问时使用 HTTPS，不要把配置内容提交到仓库或暴露给未授权客户端。
 
 ### 任务系统
 
@@ -113,7 +148,7 @@ Nova Image 采用**用户自定义模型**架构：
 - 暗色 / 亮色主题切换
 - 宽屏 / 窄屏自适应布局（左侧垂直 Tab + 右侧内容）
 - 历史任务持久化（IndexedDB / localStorage）
-- 一键备份 / 恢复（`JSZip` 打包 localStorage + IndexedDB，支持跳过不兼容旧配置并恢复其余数据）
+- 一键备份 / 恢复（流式 ZIP64 打包 localStorage + IndexedDB + localforage，兼容旧版 JSZip 备份和超过 4GB 的完整归档）
 - 历史图片懒加载（`@tanstack/react-virtual`）
 - 随机图、Toast 通知、确认对话框
 
@@ -131,7 +166,7 @@ nova-image-studio/
 │   │   │   ├── agent/        # Agent 模式相关组件
 │   │   │   └── ui/           # shadcn 风格 UI 基础件
 │   │   ├── hooks/            # useQueueStatus / useAgentChat / useGifWorkflow / ...
-│   │   ├── lib/              # 客户端工具、API 客户端、WebSocket、备份
+│   │   ├── lib/              # 客户端工具、API 客户端、WebSocket、ZIP64 备份、Nacos 配置
 │   │   └── test/             # vitest 配置与用例
 │   ├── public/               # PWA 图标、静态资源
 │   ├── next.config.ts        # 静态导出 + next-pwa 配置
@@ -146,6 +181,11 @@ nova-image-studio/
 ├── scripts/
 │   ├── pack.js               # 打包：build + 汇总到 out.zip
 │   └── generate-icons.js     # 生成 PWA 图标
+├── Caddyfile                 # 局域网 HTTPS 与内部 CA 反向代理
+├── Dockerfile.dev            # 开发预览镜像
+├── docker-compose.dev.yml    # 开发预览（源码挂载 + 依赖 volume）
+├── docker-compose.prod.yml   # 构建当前 dev 源码的生产部署
+├── deploy.env                # 生产部署环境变量模板
 ├── package.json              # npm workspaces 根
 ├── LICENSE                   # AGPL-3.0 许可证
 └── README.md
@@ -168,22 +208,36 @@ nova-image-studio/
 ### 快速启动
 
 ```bash
-# 1. 复制环境变量文件（如果不是从clone下来的，则自己新建并复制过来即可）
-cp backend/.env.example .env
+# 1. 克隆当前 dev 分支
+git clone --branch dev https://github.com/wsbjj/nova-image-studio.git
+cd nova-image-studio
 
-# 2. 编辑 .env 按需调整配置
+# 2. 复制并按需编辑生产环境变量
+cp deploy.env .env
 
-# 3. 创建必要的配置文件（如果不存在）
-touch blacklist.json prompts.json
-
-# 4. 创建数据目录
-mkdir -p data/images
-
-# 5. 启动服务
-docker compose up -d
+# 3. 仅启动 HTTP 服务，构建当前 dev 源码
+docker compose -f docker-compose.prod.yml up -d --build nova-image-studio
 ```
 
 访问 <http://localhost:3000>。
+
+`docker-compose.prod.yml` 会构建当前仓库源码；根目录 `docker-compose.yml` 保留上游预构建镜像部署方式，不包含未发布到该镜像的 `dev` 改动。
+
+### 局域网 HTTPS（可选）
+
+当前 `Caddyfile` 默认使用 `192.168.8.110`。部署到其他机器前，先把文件中的两处 IP 改成服务器实际局域网 IP，再启动完整服务：
+
+```bash
+docker compose -f docker-compose.prod.yml up -d --build
+```
+
+访问 `https://<服务器局域网 IP>`。Caddy 使用内部 CA，首次使用需要把根证书导入客户端的“受信任的根证书颁发机构”：
+
+```bash
+docker cp nova-image-studio-https:/data/caddy/pki/authorities/local/root.crt ./caddy-root.crt
+```
+
+> `caddy-root.crt` 已加入 `.gitignore`，不要提交或公开分发生产环境导出的内部 CA 文件。
 
 ### 开发预览（本机 Docker）
 
@@ -226,20 +280,20 @@ docker compose -f docker-compose.dev.yml down -v
 
 ### 环境变量
 
-通过 `backend/.env` 注入，无需修改镜像。修改后重启生效：
+Docker 部署读取根目录 `.env`（Compose 会挂载到容器 `/app/.env`）。修改启动级配置后重启生效：
 
 ```bash
-docker compose restart
+docker compose -f docker-compose.prod.yml restart nova-image-studio
 ```
 
 ### 升级
 
-拉取最新镜像并重建容器：
+拉取 `dev` 最新代码并只重建应用容器，持久化的 `./data/` 不受影响：
 
 ```bash
-docker compose down
-docker compose pull
-docker compose up -d --force-recreate
+git pull --ff-only origin dev
+docker compose -f docker-compose.prod.yml build nova-image-studio
+docker compose -f docker-compose.prod.yml up -d --no-deps --force-recreate nova-image-studio
 ```
 
 ### 数据持久化
@@ -321,7 +375,7 @@ npm run go
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/tianjiangqiji/nova-image-studio.git
+git clone --branch dev https://github.com/wsbjj/nova-image-studio.git
 cd nova-image-studio
 
 # 2. 安装依赖（自动安装根、frontend、backend）
@@ -363,19 +417,19 @@ npm run go             # 打包：build + 汇总到根 out.zip
 docker build -t nova-image-studio:latest .
 ```
 
-### 推送到仓库
+### 推送到自己的镜像仓库
 
 ```bash
-docker tag nova-image-studio:latest tianjiangqiji/nova-image-studio:latest
+docker tag nova-image-studio:latest <registry>/<namespace>/nova-image-studio:dev
 
-docker push tianjiangqiji/nova-image-studio:latest
+docker push <registry>/<namespace>/nova-image-studio:dev
 ```
 
 </details>
 
 ---
 
-## ⚙️ 环境变量（`backend/.env`）
+## ⚙️ 环境变量（Docker 使用根目录 `.env`，本地 npm 使用 `backend/.env`）
 
 | 变量 | 必填 | 默认 | 说明 |
 | --- | --- | --- | --- |
@@ -412,6 +466,7 @@ docker push tianjiangqiji/nova-image-studio:latest
 | `GET` | `/api/nova/prompts` | 提示词广场内容 |
 | `GET` | `/api/nova/blacklist` | 敏感词列表 |
 | `GET` | `/api/nova/config` | 前端配置（如 `promptGalleryMode`） |
+| `POST` | `/api/nova/remote-config/nacos/fetch` | 通过后端代理拉取并校验 Nacos 模型配置 |
 | `GET` | `/api/nova/images/:taskId/:index` | 任务产物图片 |
 | `WS` | `/api/nova/ws` | 实时任务 / 队列订阅 |
 
@@ -435,6 +490,9 @@ UI 可以打开，但任务提交、Agent、历史同步全部依赖 `/api/nova/
 
 **数据库需要单独备份吗？**
 首次部署不需要，服务启动会自建。任务数据要保留就备份 `nova-tasks.sqlite`（含 WAL/SHM）以及 `nova-images/`。重启后残留任务会被自动标记为失败并清理产物。
+
+**完整备份超过 4GB 还能导入吗？**
+可以。`dev` 分支使用流式 ZIP64 导出，并在导入时按中央目录和条目按需读取，不再把整个 ZIP 一次性载入内存；同时保留对旧版 JSZip 备份的兼容。
 
 **如何临时停止接收新任务（不停服务）？**
 编辑 `.env`：
