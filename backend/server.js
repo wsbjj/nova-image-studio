@@ -86,7 +86,7 @@ function normalizeBaseUrl(url) {
 function normalizeProtocolBaseUrl(protocol, url) {
   const normalized = normalizeBaseUrl(url);
   if (!normalized) return '';
-  if (protocol === 'google') {
+  if (protocol === 'google' || protocol === 'google-gemini') {
     return normalized.endsWith('/v1beta') ? normalized.slice(0, -7) : normalized;
   }
   return normalized.endsWith('/v1') ? normalized.slice(0, -3) : normalized;
@@ -108,9 +108,8 @@ const DB_PATH = process.env.NOVA_TASK_DB || path.join(__dirname, 'nova-tasks.sql
 const TASK_TTL_MS = 12 * 60 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
-const IMAGE_STREAM_UNSUPPORTED_PATTERN = /(?:stream.*(?:unsupported|not supported|unknown|unrecognized|invalid)|(?:unsupported|not supported|unknown|unrecognized|invalid).*stream|stream.*(?:不支持|未知|无效)|(?:不支持|未知|无效).*stream)/i;
 // 开源版：不再硬编码模型列表，由前端通过 protocol 字段指定协议类型
-const VALID_PROTOCOLS = new Set(['google', 'openai']);
+const VALID_PROTOCOLS = new Set(['google', 'openai', 'grok']);
 const GPT_IMAGE_QUALITIES = new Set(['auto', 'high', 'medium', 'low']);
 const GPT_IMAGE_STYLES = new Set(['auto', 'vivid', 'natural']);
 const GPT_IMAGE_BACKGROUNDS = new Set(['auto', 'transparent', 'opaque']);
@@ -142,6 +141,11 @@ const pendingCountByIp = new Map(); // ip -> count
 const pendingCountByApiKeyHash = new Map(); // apiKeyHash -> count
 const queue = [];
 let activeCount = 0;
+const runningTaskPromises = new Set();
+let isShuttingDown = false;
+let shutdownPromise = null;
+let httpServerRef = null;
+let wsServerRef = null;
 
 // ===== WebSocket subscription state =====
 const taskSubscriptions = new Map(); // WebSocket -> Set<taskId>
@@ -319,7 +323,7 @@ function getQueueStats() {
   const processingCount = counts[TASK_STATUS.PROCESSING] || 0;
   const queuedCount = (counts[TASK_STATUS.QUEUED] || 0) + (counts[TASK_STATUS.LEGACY_QUEUED] || 0);
   const totalActiveTasks = processingCount + queuedCount;
-  const acceptingNewTasks = !isRejectNewTasksEnabled();
+  const acceptingNewTasks = !isShuttingDown && !isRejectNewTasksEnabled();
 
   return {
     concurrencyLimit: GLOBAL_TASK_CONCURRENCY,
@@ -632,7 +636,7 @@ function validateCreatePayload(body) {
   if (!body || typeof body !== 'object') throw new Error('请求体不能为空');
   if (typeof body.apiKey !== 'string' || body.apiKey.trim().length === 0) throw new Error('缺少 API 密钥');
   if (typeof body.baseUrl !== 'string' || body.baseUrl.trim().length === 0) throw new Error('缺少 API 基础地址');
-  if (!VALID_PROTOCOLS.has(body.protocol)) throw new Error('协议类型无效，必须为 google 或 openai');
+  if (!VALID_PROTOCOLS.has(body.protocol)) throw new Error('协议类型无效，必须为 google、openai 或 grok');
   if (body.mode !== 'text-to-image' && body.mode !== 'image-to-image') throw new Error('任务模式无效');
   if (typeof body.prompt !== 'string' || body.prompt.trim().length === 0) throw new Error('提示词不能为空');
   if (typeof body.model !== 'string' || body.model.trim().length === 0) throw new Error('模型名称不能为空');
@@ -647,7 +651,7 @@ function validateCreatePayload(body) {
 function createTask(body, req) {
   validateCreatePayload(body);
   const limitConfig = getLimitConfig();
-  if (isRejectNewTasksEnabled()) {
+  if (isShuttingDown || isRejectNewTasksEnabled()) {
     throw createHttpError(503, 'SERVER_NOT_ACCEPTING_TASKS', LIMIT_ERROR_MESSAGES.notAcceptingTasks, limitConfig.retryAfterSeconds);
   }
   const source = enforceRateLimit(req, body, limitConfig);
@@ -1029,11 +1033,6 @@ async function parseGptImageResponse(response) {
   return extractImagePayload(data);
 }
 
-function isImageStreamUnsupportedError(error) {
-  const message = error instanceof Error ? error.message : String(error);
-  return IMAGE_STREAM_UNSUPPORTED_PATTERN.test(message);
-}
-
 async function requestGptImage(apiKey, request, resolvedSize, options = {}) {
   const baseUrl = options.baseUrl || resolveNovaApiBaseUrl();
   const endpoint = request.mode === 'image-to-image'
@@ -1042,6 +1041,92 @@ async function requestGptImage(apiKey, request, resolvedSize, options = {}) {
   const response = await fetchWithTimeout(
     `${baseUrl}${endpoint}`,
     createGptImageRequestInit(apiKey, request, resolvedSize, options)
+  );
+  return parseGptImageResponse(response);
+}
+
+function getGrokResolution(outputSize) {
+  if (outputSize === '2K' || outputSize === '2k') return '2k';
+  if (outputSize === '1K' || outputSize === '1k') return '1k';
+  return undefined;
+}
+
+function getGrokAspectRatio(aspectRatio) {
+  if (!aspectRatio || aspectRatio === 'auto') return undefined;
+  return String(aspectRatio);
+}
+
+function toGrokImageDataUrl(img) {
+  if (!img || typeof img !== 'object') return '';
+  if (typeof img.dataUrl === 'string' && img.dataUrl.startsWith('data:')) return img.dataUrl;
+  const mimeType = img.mimeType || 'image/png';
+  const data = typeof img.data === 'string' ? img.data : '';
+  if (!data) return '';
+  if (data.startsWith('data:')) return data;
+  return `data:${mimeType};base64,${data}`;
+}
+
+function createGrokImageRequestInit(apiKey, request, options = {}) {
+  const prompt = request.prompt;
+  const stream = Boolean(options.stream);
+  const aspectRatio = getGrokAspectRatio(request.aspectRatio);
+  const resolution = getGrokResolution(request.outputSize);
+  const images = Array.isArray(request.images) ? request.images : [];
+
+  if (request.mode === 'image-to-image') {
+    if (images.length === 0) {
+      throw new Error('图生图模式需要至少一张参考图');
+    }
+    const dataUrls = images.map(toGrokImageDataUrl).filter(Boolean);
+    if (dataUrls.length === 0) {
+      throw new Error('参考图数据无效');
+    }
+    const payload = {
+      model: request.model,
+      prompt,
+      response_format: 'url',
+      ...(stream ? { stream: true } : {}),
+      ...(aspectRatio ? { aspect_ratio: aspectRatio } : {}),
+      ...(resolution ? { resolution } : {}),
+      ...(dataUrls.length === 1 ? { image: dataUrls[0] } : { images: dataUrls }),
+    };
+    return {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(payload),
+    };
+  }
+
+  const payload = {
+    model: request.model,
+    prompt,
+    response_format: 'url',
+    ...(stream ? { stream: true } : {}),
+    ...(aspectRatio ? { aspect_ratio: aspectRatio } : {}),
+    ...(resolution ? { resolution } : {}),
+  };
+
+  return {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify(payload),
+  };
+}
+
+async function requestGrokImage(apiKey, request, options = {}) {
+  const baseUrl = options.baseUrl || resolveNovaApiBaseUrl();
+  const endpoint = request.mode === 'image-to-image'
+    ? '/v1/images/edits'
+    : '/v1/images/generations';
+  const response = await fetchWithTimeout(
+    `${baseUrl}${endpoint}`,
+    createGrokImageRequestInit(apiKey, request, options)
   );
   return parseGptImageResponse(response);
 }
@@ -1328,6 +1413,9 @@ async function generateNovaImage(apiKey, request) {
   if (request.protocol === 'openai') {
     return requestGptImage(apiKey, request, resolveGptImageRequestSize(request), { baseUrl });
   }
+  if (request.protocol === 'grok') {
+    return requestGrokImage(apiKey, request, { baseUrl });
+  }
   // 默认走 Google Gemini 协议
   return generateNovaGeminiImage(apiKey, request, { baseUrl });
 }
@@ -1395,10 +1483,12 @@ function drainQueue() {
 
     queue.shift();
     activeCount += imageSlots;
-    runTask(taskId).finally(() => {
+    const runPromise = runTask(taskId).finally(() => {
       activeCount -= imageSlots;
+      runningTaskPromises.delete(runPromise);
       drainQueue();
     });
+    runningTaskPromises.add(runPromise);
   }
 }
 
@@ -1710,6 +1800,93 @@ function setupWebSocketServer() {
   return wss;
 }
 
+function closeHttpServer(server) {
+  if (!server || typeof server.close !== 'function') return Promise.resolve();
+  return new Promise(resolve => {
+    try {
+      server.close(() => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
+
+function closeWebSocketServer(wss) {
+  if (!wss || typeof wss.close !== 'function') return Promise.resolve();
+  for (const ws of wss.clients) {
+    try {
+      ws.close(1001, 'Server shutting down');
+    } catch {
+      // ignore
+    }
+  }
+  return new Promise(resolve => {
+    try {
+      wss.close(() => resolve());
+    } catch {
+      resolve();
+    }
+  });
+}
+
+async function waitForRunningTasks() {
+  const running = Array.from(runningTaskPromises);
+  if (running.length === 0) return;
+  await Promise.allSettled(running);
+}
+
+function checkpointTaskDatabase() {
+  try {
+    const result = db.pragma('wal_checkpoint(TRUNCATE)');
+    console.log('[shutdown] SQLite WAL checkpoint 完成', result);
+  } catch (error) {
+    console.warn('[shutdown] SQLite WAL checkpoint 失败', error?.message || error);
+  }
+}
+
+function closeTaskDatabase() {
+  try {
+    db.close();
+  } catch (error) {
+    console.warn('[shutdown] SQLite 关闭失败', error?.message || error);
+  }
+}
+
+function registerShutdownHandlers() {
+  const handleShutdownSignal = signal => {
+    if (shutdownPromise) return shutdownPromise;
+
+    shutdownPromise = (async () => {
+      isShuttingDown = true;
+      console.log(`[shutdown] 收到 ${signal}，开始优雅退出`);
+
+      await Promise.allSettled([
+        closeHttpServer(httpServerRef),
+        closeWebSocketServer(wsServerRef),
+      ]);
+
+      await waitForRunningTasks();
+      checkpointTaskDatabase();
+      closeTaskDatabase();
+      process.exit(0);
+    })().catch(error => {
+      console.error('[shutdown] 优雅退出失败', error);
+      closeTaskDatabase();
+      process.exit(1);
+    });
+
+    return shutdownPromise;
+  };
+
+  process.on('SIGTERM', () => {
+    void handleShutdownSignal('SIGTERM');
+  });
+
+  process.on('SIGINT', () => {
+    void handleShutdownSignal('SIGINT');
+  });
+}
+
 async function handleApi(req, res, pathname) {
   try {
     const apiPathname = pathname.replace(/\/+$/, '');
@@ -1846,7 +2023,7 @@ async function handleApi(req, res, pathname) {
       return true;
     }
 
-    // ===== 文本 AI 代理（流式 + 非流式，OpenAI / Google 协议） =====
+    // ===== 文本 AI 代理（流式 + 非流式，多文本协议） =====
     if (req.method === 'POST' && apiPathname === '/api/nova/proxy/text') {
       try {
         const body = await readJsonBody(req);
@@ -1860,9 +2037,18 @@ async function handleApi(req, res, pathname) {
         let targetUrl;
         const authHeaders = { 'Content-Type': 'application/json' };
 
-        if (protocol === 'google') {
-          targetUrl = `${normalizedBaseUrl}/v1beta/models/${encodeURIComponent(model || '')}:streamGenerateContent?alt=sse`;
+        if (protocol === 'google' || protocol === 'google-gemini') {
+          targetUrl = stream
+            ? `${normalizedBaseUrl}/v1beta/models/${encodeURIComponent(model || '')}:streamGenerateContent?alt=sse`
+            : `${normalizedBaseUrl}/v1beta/models/${encodeURIComponent(model || '')}:generateContent`;
           authHeaders['x-goog-api-key'] = apiKey;
+          authHeaders['Authorization'] = `Bearer ${apiKey}`;
+        } else if (protocol === 'anthropic-messages') {
+          targetUrl = `${normalizedBaseUrl}/v1/messages`;
+          authHeaders['x-api-key'] = apiKey;
+          authHeaders['anthropic-version'] = '2023-06-01';
+        } else if (protocol === 'openai-chat-completions') {
+          targetUrl = `${normalizedBaseUrl}/v1/chat/completions`;
           authHeaders['Authorization'] = `Bearer ${apiKey}`;
         } else {
           targetUrl = `${normalizedBaseUrl}/v1/responses`;
@@ -1926,7 +2112,7 @@ async function handleApi(req, res, pathname) {
       return true;
     }
 
-    // ===== 模型检查代理（统一使用 /v1/models） =====
+    // ===== 模型检查代理（按协议查询模型列表） =====
     if (req.method === 'GET' && apiPathname === '/api/nova/proxy/models') {
       try {
         const parsed = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
@@ -1939,10 +2125,19 @@ async function handleApi(req, res, pathname) {
         }
 
         const normalizedBaseUrl = normalizeProtocolBaseUrl(protocol, baseUrl);
-        const modelsUrl = `${normalizedBaseUrl}/v1/models`;
-        // 模型列表查询只发送 Authorization 头。x-goog-api-key 仅用于 Gemini 生成端点，
-        // 对 /v1/models (兼容 OpenAI 格式的 NewAPI 等) 会引发错误或返回空列表。
-        const headers = { Authorization: `Bearer ${apiKey}` };
+        let modelsUrl = `${normalizedBaseUrl}/v1/models`;
+        const headers = {};
+
+        if (protocol === 'google' || protocol === 'google-gemini') {
+          modelsUrl = `${normalizedBaseUrl}/v1beta/models`;
+          headers['x-goog-api-key'] = apiKey;
+          headers['Authorization'] = `Bearer ${apiKey}`;
+        } else if (protocol === 'anthropic-messages') {
+          headers['x-api-key'] = apiKey;
+          headers['anthropic-version'] = '2023-06-01';
+        } else {
+          headers['Authorization'] = `Bearer ${apiKey}`;
+        }
 
         const response = await fetchWithTimeout(modelsUrl, { method: 'GET', headers });
         let data = null;
@@ -2052,7 +2247,12 @@ const startServer = () => {
       console.log(`Listening on ${listenUrl}`);
     }
   });
+
+  wsServerRef = wss;
+  httpServerRef = httpServer;
 };
+
+registerShutdownHandlers();
 
 if (IS_DEV) {
   app.prepare().then(startServer);

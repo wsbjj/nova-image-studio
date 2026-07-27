@@ -46,6 +46,11 @@ import {
   type ProviderProtocol,
   type TextModelConfig,
 } from '@/lib/nova-models';
+import {
+  getTextProviderDescription,
+  getTextProviderLabel,
+  type TextProviderProtocol,
+} from '@/lib/nova-text-protocol';
 import { syncDynamicModelExports } from '@/lib/gemini-config';
 import { exportAllData, importAllData, downloadBlob, generateBackupFilename, type BackupProgress as BackupProgressType } from '@/lib/backup-utils';
 import { checkModelsAvailability, type ModelStatus } from '@/lib/ccode-task-client';
@@ -90,7 +95,7 @@ function createImageModelDraft(): ImageModelConfig {
 }
 
 function createTextModelDraft(): TextModelConfig {
-  const template = getDefaultTextModelTemplate('openai');
+  const template = getDefaultTextModelTemplate('openai-responses');
   return {
     id: generateModelId('txt'),
     protocol: template.protocol,
@@ -231,7 +236,7 @@ export function SettingsModal({ isOpen, onClose, onApiKeyChange }: SettingsModal
         next.maxOutputSize = preset.maxOutputSize;
         next.supportsAdvancedParams = preset.supportsAdvancedParams;
       }
-      if (patch.protocol === 'google') {
+      if (patch.protocol === 'google' || patch.protocol === 'grok') {
         next.supportsAdvancedParams = false;
       }
       return next;
@@ -257,14 +262,14 @@ export function SettingsModal({ isOpen, onClose, onApiKeyChange }: SettingsModal
     setSelectedTextModelId(draft.id);
   };
 
-  const handleApplyTextTemplate = (id: string, protocol: ProviderProtocol) => {
+  const handleApplyTextTemplate = (id: string, protocol: TextProviderProtocol) => {
     const template = getDefaultTextModelTemplate(protocol);
     handleUpdateTextModel(id, {
       protocol: template.protocol,
       name: template.name,
       modelId: template.modelId,
       baseUrl: template.baseUrl,
-      note: template.note,
+      note: template.note || getTextProviderDescription(template.protocol),
     });
   };
 
@@ -530,6 +535,7 @@ export function SettingsModal({ isOpen, onClose, onApiKeyChange }: SettingsModal
                         options={[
                           { value: 'google', label: 'Google' },
                           { value: 'openai', label: 'OpenAI Images' },
+                          { value: 'grok', label: 'Grok Images' },
                         ]}
                       />
                     </div>
@@ -566,7 +572,17 @@ export function SettingsModal({ isOpen, onClose, onApiKeyChange }: SettingsModal
                     </div>
                     <div className="space-y-2">
                       <label className="text-xs text-muted-foreground">最大参考图数量</label>
-                      <Input type="number" min={1} value={selectedImageModel.maxRefImages} onChange={(event) => handleUpdateImageModel(selectedImageModel.id, { maxRefImages: Number(event.target.value) || 1 })} />
+                      <Input
+                        type="number"
+                        min={0}
+                        value={selectedImageModel.maxRefImages}
+                        onChange={(event) => {
+                          const next = Number(event.target.value);
+                          handleUpdateImageModel(selectedImageModel.id, {
+                            maxRefImages: Number.isFinite(next) && next >= 0 ? Math.floor(next) : 0,
+                          });
+                        }}
+                      />
                     </div>
                     <div className="space-y-2">
                       <label className="text-xs text-muted-foreground">最大分辨率</label>
@@ -633,13 +649,15 @@ export function SettingsModal({ isOpen, onClose, onApiKeyChange }: SettingsModal
                       <Select
                         value={selectedTextModel.protocol}
                         onValueChange={(value) => {
-                          const protocol = value as ProviderProtocol;
+                          const protocol = value as TextProviderProtocol;
                           handleUpdateTextModel(selectedTextModel.id, { protocol });
                           handleApplyTextTemplate(selectedTextModel.id, protocol);
                         }}
                         options={[
-                          { value: 'openai', label: 'OpenAI Response' },
-                          { value: 'google', label: 'Google Gemini' },
+                          { value: 'openai-responses', label: getTextProviderLabel('openai-responses') },
+                          { value: 'openai-chat-completions', label: getTextProviderLabel('openai-chat-completions') },
+                          { value: 'anthropic-messages', label: getTextProviderLabel('anthropic-messages') },
+                          { value: 'google-gemini', label: getTextProviderLabel('google-gemini') },
                         ]}
                       />
                     </div>

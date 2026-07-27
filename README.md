@@ -137,7 +137,7 @@ Nacos 配置内容至少需要包含以下字段：
 
 - 提交后入队，服务端并发处理（默认上限 50，可通过 `NOVA_TASK_CONCURRENCY` 调整）
 - 浏览器通过 **WebSocket** 实时接收任务/队列状态，断线自动重连，失败 5 次后回退 **HTTP 轮询**（30 秒间隔）
-- 任务结果本地落盘（`backend/nova-images/`），HTTP 路由 `/api/nova/images/:taskId/:index` 直接提供
+- 任务结果本地落盘（默认 `backend/data/nova-images/`，可用 `NOVA_IMAGE_DIR` 调整），HTTP 路由 `/api/nova/images/:taskId/:index` 直接提供
 - 任务 TTL 12 小时，过期自动清理（5 分钟一次）
 - 服务重启时把残留"处理中"任务标记为失败并删除产物，避免幽灵任务
 
@@ -208,24 +208,40 @@ nova-image-studio/
 ### 快速启动
 
 ```bash
-# 1. 克隆当前 dev 分支
+# 方案 A：构建当前 dev 源码（推荐）
 git clone --branch dev https://github.com/wsbjj/nova-image-studio.git
 cd nova-image-studio
 
-# 2. 复制并按需编辑生产环境变量
+# 复制并按需编辑生产环境变量
 cp deploy.env .env
 
-# 3. 仅启动 HTTP 服务，构建当前 dev 源码
+# 仅启动 HTTP 服务，构建当前 dev 源码
 docker compose -f docker-compose.prod.yml up -d --build nova-image-studio
+
 ```
 
 访问 <http://localhost:3000>。
+
+如果只使用根目录预构建镜像（二选一，不包含未发布到镜像的 `dev` 改动），在仓库目录中执行：
+
+```bash
+cp backend/.env.docker.example .env
+mkdir -p data
+docker compose up -d
+```
 
 `docker-compose.prod.yml` 会构建当前仓库源码；根目录 `docker-compose.yml` 保留上游预构建镜像部署方式，不包含未发布到该镜像的 `dev` 改动。
 
 ### 局域网 HTTPS（可选）
 
 当前 `Caddyfile` 默认使用 `192.168.8.110`。部署到其他机器前，先把文件中的两处 IP 改成服务器实际局域网 IP，再启动完整服务：
+
+通过根目录 `.env` 挂载到容器 `/app/.env` 注入（代码用 `process.cwd()/.env` 读取），无需修改镜像。
+
+修改后：
+
+- 限流 / 队列 / 广场模式等运行时配置：约 1 秒内自动生效
+- `PORT` / `HOSTNAME` / `NODE_ENV` / 数据路径：需重启
 
 ```bash
 docker compose -f docker-compose.prod.yml up -d --build
@@ -298,10 +314,19 @@ docker compose -f docker-compose.prod.yml up -d --no-deps --force-recreate nova-
 
 ### 数据持久化
 
-以下目录自动挂载到 `./data/`：
+`docker-compose.yml` 会挂载：
 
-- `nova-images/` - 生成的图片
-- `nova-tasks.sqlite` - 任务数据库
+| 宿主机 | 容器内 | 用途 |
+| --- | --- | --- |
+| `./data` | `/app/backend/data` | 数据库 + 图片（含 WAL/SHM） |
+| `./.env` | `/app/.env` | 环境变量 |
+| `./backend/blacklist.json` | `/app/backend/blacklist.json` | 敏感词 |
+| `./backend/prompts.json` | `/app/backend/prompts.json` | 提示词广场 |
+
+`./data` 内实际文件（由 `NOVA_*` 路径决定）：
+
+- `nova-tasks.sqlite`（及 `-wal` / `-shm`）— 任务数据库
+- `nova-images/` — 生成的图片
 
 </details>
 
@@ -334,23 +359,35 @@ backend/package.json
 backend/package-lock.json
 backend/prompts.json
 backend/blacklist.json
-backend/.env          # 按生产环境调整
+backend/.env          # 按生产环境调整（cwd=backend）
+```
+
+`backend/.env` 建议：
+
+```env
+NODE_ENV=production
+NOVA_TASK_DB=./data/nova-tasks.sqlite
+NOVA_IMAGE_DIR=./data/nova-images
 ```
 
 #### 3. 在生产服务器
 
+在项目根目录执行（`npm start` 会 `cd backend` 再启动）：
+
 ```bash
-npm ci --omit=dev        # 必须本地装 better-sqlite3 原生模块
-npm start                # 或 npm run server
+cd backend && npm ci --omit=dev   # 必须本地装 better-sqlite3 原生模块
+cd ..
+npm start                         # 等价于 cd backend && node server.js
 ```
 
-`.env` 中 `NODE_ENV=production`。
+服务会在 `backend/data/` 下自动创建数据库与图片目录。
 
 #### 4. 进程托管
 
 推荐 **PM2 / systemd / 平台自带进程管理**，确保：
 
-- 进程对 `NOVA_TASK_DB` 指向的 SQLite 文件有读写权限
+- 进程工作目录最终在 `backend/`（与 `npm start` 一致），或绝对路径配置 `NOVA_TASK_DB` / `NOVA_IMAGE_DIR`
+- 进程对 `backend/data/`（或你配置的路径）有读写权限
 - 反向代理（Nginx / Caddy / 云网关）将域名转到 `http://127.0.0.1:3000`
 
 #### 5. 一键打包
@@ -381,15 +418,20 @@ cd nova-image-studio
 # 2. 安装依赖（自动安装根、frontend、backend）
 npm install
 
-# 3. 复制后端环境变量
+# 3. 复制后端环境变量（本地 cwd=backend，使用相对路径 ./data/...）
 cp backend/.env.example backend/.env
 # Windows: Copy-Item backend/.env.example backend/.env
+# 确认 backend/.env 中：
+#   NOVA_TASK_DB=./data/nova-tasks.sqlite
+#   NOVA_IMAGE_DIR=./data/nova-images
 
 # 4. 启动开发模式（等同于 build 后用 production 模式跑 server.js）
 npm run dev
 ```
 
 访问 <http://localhost:3000>。
+
+本地数据落在 `backend/data/`（数据库 + `nova-images/`）。
 
 > 首次启动时需要在 UI 的"设置"中至少完成一个图片模型和一个文本模型配置，并设置默认模型。所有前端配置均保存在浏览器 localStorage，可通过备份功能导出。
 
@@ -431,12 +473,19 @@ docker push <registry>/<namespace>/nova-image-studio:dev
 
 ## ⚙️ 环境变量（Docker 使用根目录 `.env`，本地 npm 使用 `backend/.env`）
 
+| 场景 | 模板 | 复制到 | 数据路径（模板已写好） |
+| --- | --- | --- | --- |
+| 本地开发 / 本地生产 | `backend/.env.example` | `backend/.env` | `./data/nova-tasks.sqlite`、`./data/nova-images` |
+| Docker 预构建镜像 | `backend/.env.docker.example` | 项目根 `.env` | `backend/data/nova-tasks.sqlite`、`backend/data/nova-images` |
+| dev 源码生产部署 | `deploy.env` | 项目根 `.env` | `/app/backend/data/nova-tasks.sqlite`、`/app/backend/data/nova-images` |
+
 | 变量 | 必填 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `PORT` | 否 | `3000` | 监听端口 |
 | `HOSTNAME` | 否 | `0.0.0.0` | 绑定地址，`localhost`/`127.0.0.1` 仅本机 |
 | `NODE_ENV` | **是** | `production` | **必须为 `production`**，否则会走 Next dev 模式 |
-| `NOVA_TASK_DB` | 否 | `./nova-tasks.sqlite` | SQLite 文件路径，建议放到持久化目录 |
+| `NOVA_TASK_DB` | 否 | `./nova-tasks.sqlite` | SQLite 文件路径（相对 `process.cwd()`）；建议 `./data/...` 或 Docker 下 `backend/data/...` |
+| `NOVA_IMAGE_DIR` | 否 | `./nova-images`（相对 `__dirname` 即 `backend/`） | 任务产物落盘目录；建议 `./data/nova-images` 或 Docker 下 `backend/data/nova-images` |
 | `NOVA_TASK_CONCURRENCY` | 否 | `50` | 最大并发任务数（绝对上限 50） |
 | `NOVA_MAX_QUEUE_SIZE` | 否 | `200` | 全局最大待处理任务数 |
 | `NOVA_RATE_LIMIT_WINDOW_MS` | 否 | `60000` | 创建任务速率限制窗口，单位毫秒 |
@@ -445,11 +494,10 @@ docker push <registry>/<namespace>/nova-image-studio:dev
 | `NOVA_MAX_PENDING_TASKS_PER_IP` | 否 | `20` | 单 IP 最多同时拥有多少个待处理任务 |
 | `NOVA_MAX_PENDING_TASKS_PER_API_KEY` | 否 | `10` | 单 API Key 最多同时拥有多少个待处理任务 |
 | `NOVA_RATE_LIMIT_RETRY_AFTER_SECONDS` | 否 | `30` | 队列满/限流时响应头 `Retry-After` 秒数 |
-| `NOVA_IMAGE_DIR` | 否 | `backend/nova-images/` | 任务产物落盘目录 |
 | `PROMPT_GALLERY_MODE` | 否 | `2` | `1` 常驻 / `2` 私密密码（点七下标题） / `3` 关闭 |
 | `PROMPT_GALLERY_PASSWORD` | 否 | 空 | 提示词广场私密模式密码；为空时私密模式可直接开启 |
 
-> `.env` 修改后大部分运行时配置**实时生效**（任务并发、限流、队列容量、接单开关、广场模式），无需重启；`PORT`、`HOSTNAME`、`NODE_ENV` 这类启动级配置仍需重启。
+> `.env` 修改后大部分运行时配置**实时生效**（任务并发、限流、队列容量、接单开关、广场模式），无需重启；`PORT`、`HOSTNAME`、`NODE_ENV`、`NOVA_TASK_DB`、`NOVA_IMAGE_DIR` 这类启动级配置仍需重启。
 
 ---
 
@@ -489,7 +537,7 @@ docker push <registry>/<namespace>/nova-image-studio:dev
 UI 可以打开，但任务提交、Agent、历史同步全部依赖 `/api/nova/*`，必须运行 `server.js`。
 
 **数据库需要单独备份吗？**
-首次部署不需要，服务启动会自建。任务数据要保留就备份 `nova-tasks.sqlite`（含 WAL/SHM）以及 `nova-images/`。重启后残留任务会被自动标记为失败并清理产物。
+首次部署不需要，服务启动会自建。任务数据要保留就备份数据目录（本地 `backend/data/`，Docker 宿主机 `./data/`）里的 `nova-tasks.sqlite`（含 WAL/SHM）以及 `nova-images/`。重启后残留任务会被自动标记为失败并清理产物。
 
 **完整备份超过 4GB 还能导入吗？**
 可以。`dev` 分支使用流式 ZIP64 导出，并在导入时按中央目录和条目按需读取，不再把整个 ZIP 一次性载入内存；同时保留对旧版 JSZip 备份的兼容。
