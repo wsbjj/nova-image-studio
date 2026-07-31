@@ -38,6 +38,7 @@ backend/ccode-images/
 .trae/
 .codex/
 .agents/
+/docs/
 
 data/
 # Docker Compose 运行时在根目录复制的配置（勿提交）

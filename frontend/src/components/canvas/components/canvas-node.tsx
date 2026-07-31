@@ -26,6 +26,7 @@ type CanvasNodeProps = {
   imageUrl?: string;
   isSelected: boolean;
   isRelated: boolean;
+  isRouteActive: boolean;
   isConnectionTarget: boolean;
   referenceLimitExceeded?: boolean;
   zIndex: number;
@@ -35,6 +36,7 @@ type CanvasNodeProps = {
   onContextMenu: (event: React.MouseEvent, nodeId: string) => void;
   onConnectStart: (event: React.PointerEvent, nodeId: string, handleType: "source" | "target") => void;
   onResizeStart: (event: React.PointerEvent, nodeId: string, corner: ResizeCorner) => void;
+  onTitleChange: (nodeId: string, title: string) => void;
   onContentChange: (nodeId: string, content: string) => void;
   onUploadToNode?: (nodeId: string) => void;
   onImportToNode?: (nodeId: string) => void;
@@ -54,6 +56,7 @@ export const CanvasNode = React.memo(function CanvasNode({
   imageUrl,
   isSelected,
   isRelated,
+  isRouteActive,
   isConnectionTarget,
   referenceLimitExceeded = false,
   zIndex,
@@ -63,6 +66,7 @@ export const CanvasNode = React.memo(function CanvasNode({
   onContextMenu,
   onConnectStart,
   onResizeStart,
+  onTitleChange,
   onContentChange,
   onUploadToNode,
   onImportToNode,
@@ -76,18 +80,23 @@ export const CanvasNode = React.memo(function CanvasNode({
   onToggleRenderMode,
   renderPanel,
 }: CanvasNodeProps) {
+  const [titleDraft, setTitleDraft] = useState<string | null>(null);
   const theme = canvasTheme;
   const status = data.metadata?.status ?? "idle";
-  const borderColor = referenceLimitExceeded ? "var(--destructive)" : isSelected || isConnectionTarget ? theme.node.activeStroke : isRelated ? theme.node.muted : theme.node.stroke;
+  const borderColor = referenceLimitExceeded ? "var(--destructive)" : isSelected || isConnectionTarget || isRouteActive ? theme.node.activeStroke : isRelated ? theme.node.muted : theme.node.stroke;
   const boxShadow = referenceLimitExceeded
     ? "0 0 0 4px color-mix(in srgb, var(--destructive) 18%, transparent)"
     : isSelected
       ? `0 0 0 4px color-mix(in srgb, ${theme.node.activeStroke} 18%, transparent)`
-      : undefined;
+      : isRouteActive
+        ? `0 0 0 3px color-mix(in srgb, ${theme.node.activeStroke} 12%, transparent)`
+        : undefined;
 
   return (
     <div
       data-node-id={data.id}
+      data-selected={isSelected || undefined}
+      data-route-active={isRouteActive || undefined}
       className="group absolute [&_button]:cursor-pointer"
       style={{ left: data.position.x, top: data.position.y, width: data.width, height: data.height, zIndex }}
       onPointerDown={(event) => onPointerDownNode(event, data.id)}
@@ -97,8 +106,47 @@ export const CanvasNode = React.memo(function CanvasNode({
         className="relative flex h-full w-full flex-col overflow-hidden rounded-2xl border-2 shadow-sm transition-[border-color,box-shadow]"
         style={{ borderColor, background: theme.node.fill, boxShadow }}
       >
-        <div className="flex items-center gap-2 px-2.5 py-1.5 text-[11px] font-medium" style={{ color: theme.node.label }}>
-          <span className="truncate">{data.title}</span>
+        <div
+          className="flex min-h-7 items-center gap-2 px-2.5 py-1 text-[11px] font-medium"
+          style={{ color: theme.node.label }}
+          onDoubleClick={(event) => {
+            event.stopPropagation();
+            setTitleDraft(data.title);
+          }}
+          title={titleDraft === null ? "双击重命名节点" : undefined}
+        >
+          {titleDraft === null ? (
+            <span className="truncate">{data.title}</span>
+          ) : (
+            <input
+              autoFocus
+              aria-label="节点标题"
+              data-canvas-no-zoom="true"
+              value={titleDraft}
+              onFocus={(event) => event.currentTarget.select()}
+              onChange={(event) => setTitleDraft(event.target.value)}
+              onPointerDown={(event) => event.stopPropagation()}
+              onDoubleClick={(event) => event.stopPropagation()}
+              onBlur={() => {
+                const nextTitle = titleDraft.trim();
+                setTitleDraft(null);
+                if (nextTitle && nextTitle !== data.title) onTitleChange(data.id, nextTitle);
+              }}
+              onKeyDown={(event) => {
+                event.stopPropagation();
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  const nextTitle = titleDraft.trim();
+                  setTitleDraft(null);
+                  if (nextTitle && nextTitle !== data.title) onTitleChange(data.id, nextTitle);
+                } else if (event.key === "Escape") {
+                  event.preventDefault();
+                  setTitleDraft(null);
+                }
+              }}
+              className="h-5 min-w-0 flex-1 rounded border border-input bg-background px-1.5 text-[11px] font-medium text-foreground outline-none focus:border-ring focus:ring-1 focus:ring-ring/40"
+            />
+          )}
         </div>
 
         <div className="relative min-h-0 flex-1">

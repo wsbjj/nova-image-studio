@@ -2,7 +2,7 @@
 
 import { useEffect } from "react";
 import { createPortal } from "react-dom";
-import { Copy, Crop, Eraser, Grid3x3, Maximize2, PaintBucket, RefreshCw, Rotate3d, Sparkles, Text, Trash2, Type } from "lucide-react";
+import { Copy, Crop, Eraser, FileText, Grid3x3, Image as ImageIcon, Maximize2, PaintBucket, RefreshCw, Rotate3d, Settings2, Sparkles, Square, Text, Trash2, Type } from "lucide-react";
 
 import { CanvasNodeType, type CanvasNodeData, type ContextMenuState } from "../types";
 
@@ -21,6 +21,10 @@ export type CanvasContextMenuActions = {
   onAiGenerateText?: (prompt: string) => void;
   onAnnotationChangeColor?: () => void;
   onAnnotationChangeFontSize?: () => void;
+  onAddNodeAt?: (type: CanvasNodeType) => void;
+  onConnectionCreate?: (type: CanvasNodeType) => void;
+  onPasteAt?: () => void;
+  canPaste?: boolean;
 };
 
 export function CanvasContextMenu({ state, node, onClose, actions }: { state: ContextMenuState | null; node?: CanvasNodeData; onClose: () => void; actions: CanvasContextMenuActions }) {
@@ -45,7 +49,18 @@ export function CanvasContextMenu({ state, node, onClose, actions }: { state: Co
   const isAnnotation = state.type === "node" && node?.type === CanvasNodeType.TextAnnotation;
 
   const items: { label: string; icon: React.ReactNode; onClick: () => void; danger?: boolean }[] = [];
-  if (state.type === "connection") {
+  if (state.type === "connection-create") {
+    items.push({ label: "图片", icon: <ImageIcon className="size-4" />, onClick: () => actions.onConnectionCreate?.(CanvasNodeType.Image) });
+    items.push({ label: "文本", icon: <FileText className="size-4" />, onClick: () => actions.onConnectionCreate?.(CanvasNodeType.Text) });
+    items.push({ label: "注释", icon: <Square className="size-4" />, onClick: () => actions.onConnectionCreate?.(CanvasNodeType.TextAnnotation) });
+    items.push({ label: "编排", icon: <Settings2 className="size-4" />, onClick: () => actions.onConnectionCreate?.(CanvasNodeType.Config) });
+  } else if (state.type === "canvas") {
+    items.push({ label: "在此添加图片节点", icon: <ImageIcon className="size-4" />, onClick: () => actions.onAddNodeAt?.(CanvasNodeType.Image) });
+    items.push({ label: "在此添加文本节点", icon: <FileText className="size-4" />, onClick: () => actions.onAddNodeAt?.(CanvasNodeType.Text) });
+    items.push({ label: "在此添加生成配置", icon: <Settings2 className="size-4" />, onClick: () => actions.onAddNodeAt?.(CanvasNodeType.Config) });
+    items.push({ label: "在此添加注释", icon: <Square className="size-4" />, onClick: () => actions.onAddNodeAt?.(CanvasNodeType.TextAnnotation) });
+    if (actions.canPaste && actions.onPasteAt) items.push({ label: "粘贴到此处", icon: <Copy className="size-4" />, onClick: actions.onPasteAt });
+  } else if (state.type === "connection") {
     items.push({ label: "删除连线", icon: <Trash2 className="size-4" />, onClick: actions.onDeleteConnection, danger: true });
   } else {
     if (canGenerate) items.push({ label: "生成", icon: <Sparkles className="size-4" />, onClick: actions.onGenerate });

@@ -20,6 +20,7 @@ export enum CanvasNodeType {
 }
 
 export type CanvasNodeStatus = "idle" | "success" | "loading" | "submitting" | "queued" | "processing" | "error";
+export type CanvasInteractionMode = "select" | "pan";
 /** 移植后画布只生成图像（走宿主任务队列），不含 video/audio。 */
 export type CanvasGenerationMode = "image";
 export type CanvasImageGenerationType = "generation" | "edit";
@@ -36,6 +37,10 @@ export type CanvasGenerationConfig = {
   gptImageStyle: GptImageStyle;
   gptImageBackground: GptImageBackground;
 };
+
+export type CanvasPromptRouteSelection =
+  | { mode: "manual" }
+  | { mode: "route"; connectionIds: string[] };
 
 export type CanvasNodeMetadata = {
   content?: string;
@@ -67,6 +72,8 @@ export type CanvasNodeMetadata = {
   genConfig?: CanvasGenerationConfig;
   /** 配置节点：锁定结果节点模式 */
   lockResultNodes?: boolean;
+  /** 配置节点：手动编排或绑定的上游提示词路线 */
+  promptRouteSelection?: CanvasPromptRouteSelection;
   /** 单节点生成任务 ID（用于轮询 + 刷新恢复） */
   generationTaskId?: string;
   /** 单节点生成开始时间戳（用于计算用时） */
@@ -118,6 +125,20 @@ export type SelectionBox = {
 };
 
 export type ContextMenuState =
+  | {
+      type: "canvas";
+      x: number;
+      y: number;
+      position: Position;
+    }
+  | {
+      type: "connection-create";
+      x: number;
+      y: number;
+      position: Position;
+      sourceNodeId: string;
+      handleType: "source" | "target";
+    }
   | {
       type: "node";
       x: number;

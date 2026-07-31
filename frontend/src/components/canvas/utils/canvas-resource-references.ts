@@ -43,10 +43,27 @@ export function getGenerationResourceNodes(nodeId: string, nodes: CanvasNodeData
 }
 
 function getContextResourceNodes(nodeId: string, nodes: CanvasNodeData[], connections: CanvasConnection[]) {
-  return connections
-    .filter((connection) => connection.toNodeId === nodeId)
-    .map((connection) => nodes.find((node) => node.id === connection.fromNodeId))
-    .filter((node): node is CanvasNodeData => Boolean(node && isResourceNode(node)));
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const incoming = new Map<string, CanvasConnection[]>();
+  for (const connection of connections) {
+    incoming.set(connection.toNodeId, [...(incoming.get(connection.toNodeId) ?? []), connection]);
+  }
+
+  const result: CanvasNodeData[] = [];
+  const visited = new Set([nodeId]);
+  const walk = (targetId: string) => {
+    for (const connection of incoming.get(targetId) ?? []) {
+      if (visited.has(connection.fromNodeId)) continue;
+      visited.add(connection.fromNodeId);
+      const source = nodeById.get(connection.fromNodeId);
+      if (!source || source.type === CanvasNodeType.Config) continue;
+      walk(source.id);
+      if (isResourceNode(source)) result.push(source);
+    }
+  };
+
+  walk(nodeId);
+  return result;
 }
 
 function getConnectedConfigResourceNodes(nodeId: string, nodes: CanvasNodeData[], connections: CanvasConnection[]) {

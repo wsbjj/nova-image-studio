@@ -19,9 +19,12 @@ export type CanvasProject = {
 };
 
 type CanvasProjectPatch = Partial<Pick<CanvasProject, "nodes" | "connections" | "backgroundMode" | "showImageInfo" | "viewport">>;
+type CanvasProjectUpdateOptions = { touchUpdatedAt?: boolean };
+export type CanvasSaveStatus = "saved" | "saving" | "error";
 
 type CanvasStore = {
   hydrated: boolean;
+  saveStatus: CanvasSaveStatus;
   projects: CanvasProject[];
   createProject: (title?: string) => string;
   importProject: (project: Partial<CanvasProject>) => string;
@@ -29,7 +32,7 @@ type CanvasStore = {
   renameProject: (id: string, title: string) => void;
   deleteProjects: (ids: string[]) => void;
   replaceProjects: (projects: CanvasProject[]) => void;
-  updateProject: (id: string, patch: CanvasProjectPatch) => void;
+  updateProject: (id: string, patch: CanvasProjectPatch, options?: CanvasProjectUpdateOptions) => void;
 };
 
 const initialViewport: ViewportTransform = { x: 0, y: 0, k: 1 };
@@ -37,6 +40,27 @@ const CANVAS_STORE_KEY = "nova-image:canvas_store";
 type PersistedCanvasState = Pick<CanvasStore, "projects">;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let queuedPersistState: PersistedCanvasState | null = null;
+let queuedPersistValue: { name: string; value: StorageValue<CanvasStore> } | null = null;
+
+async function persistQueuedCanvasState() {
+  const queued = queuedPersistValue;
+  if (!queued) return;
+  queuedPersistValue = null;
+  try {
+    await localForageStorage.setItem(queued.name, JSON.stringify(queued.value));
+    if (!queuedPersistValue) useCanvasStore.setState({ saveStatus: "saved" });
+  } catch {
+    useCanvasStore.setState({ saveStatus: "error" });
+  }
+}
+
+export async function flushPendingCanvasSave() {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  await persistQueuedCanvasState();
+}
 
 const canvasStorage: PersistStorage<CanvasStore> = {
   getItem: async (name) => {
@@ -50,10 +74,12 @@ const canvasStorage: PersistStorage<CanvasStore> = {
     const nextState = value.state as PersistedCanvasState;
     if (queuedPersistState && queuedPersistState.projects === nextState.projects) return;
     queuedPersistState = nextState;
+    queuedPersistValue = { name, value };
+    useCanvasStore.setState({ saveStatus: "saving" });
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
       saveTimer = null;
-      void localForageStorage.setItem(name, JSON.stringify(value));
+      void persistQueuedCanvasState();
     }, 400);
   },
   removeItem: (name) => localForageStorage.removeItem(name),
@@ -63,6 +89,7 @@ export const useCanvasStore = create<CanvasStore>()(
   persist(
     (set, get) => ({
       hydrated: false,
+      saveStatus: "saved",
       projects: [],
       createProject: (title = "未命名画布") => {
         const now = new Date().toISOString();
@@ -110,9 +137,18 @@ export const useCanvasStore = create<CanvasStore>()(
           return { projects };
         }),
       replaceProjects: (projects) => set({ projects }),
-      updateProject: (id, patch) =>
+      updateProject: (id, patch, options) =>
         set((state) => ({
-          projects: state.projects.map((project) => (project.id === id ? { ...project, ...patch, updatedAt: new Date().toISOString() } : project)),
+          projects: state.projects.map((project) => {
+            if (project.id !== id) return project;
+            const changed = Object.entries(patch).some(([key, value]) => project[key as keyof CanvasProject] !== value);
+            if (!changed) return project;
+            return {
+              ...project,
+              ...patch,
+              updatedAt: options?.touchUpdatedAt === false ? project.updatedAt : new Date().toISOString(),
+            };
+          }),
         })),
     }),
     {

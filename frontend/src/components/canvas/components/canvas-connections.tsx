@@ -8,6 +8,7 @@ export function ConnectionPath({
   from,
   to,
   active,
+  routeActive = false,
   onSelect,
   onContextMenu,
 }: {
@@ -15,6 +16,7 @@ export function ConnectionPath({
   from: CanvasNodeData;
   to: CanvasNodeData;
   active: boolean;
+  routeActive?: boolean;
   onSelect: () => void;
   onContextMenu?: (event: ReactMouseEvent<SVGPathElement>) => void;
 }) {
@@ -31,6 +33,7 @@ export function ConnectionPath({
     <g>
       <path
         data-connection-id={connection.id}
+        data-route-active={routeActive || undefined}
         d={pathD}
         stroke="transparent"
         strokeWidth="16"
@@ -48,11 +51,11 @@ export function ConnectionPath({
       />
       <path
         d={pathD}
-        stroke={active ? theme.node.activeStroke : theme.node.muted}
-        strokeWidth={active ? 3 : 2}
-        strokeOpacity={active ? 1 : 0.82}
+        stroke={active || routeActive ? theme.node.activeStroke : theme.node.muted}
+        strokeWidth={active || routeActive ? 3 : 2}
+        strokeOpacity={active || routeActive ? 1 : 0.82}
         fill="none"
-        style={{ filter: active ? `drop-shadow(0 0 8px color-mix(in srgb, ${theme.node.activeStroke} 40%, transparent))` : undefined, pointerEvents: "none" }}
+        style={{ filter: active || routeActive ? `drop-shadow(0 0 8px color-mix(in srgb, ${theme.node.activeStroke} 40%, transparent))` : undefined, pointerEvents: "none" }}
       />
     </g>
   );

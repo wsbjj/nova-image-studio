@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, Check, CloudAlert, LoaderCircle } from "lucide-react";
 import { nanoid } from "nanoid";
 
 import { Button } from "@/components/ui/button";
@@ -19,12 +19,14 @@ import { CanvasPromptGalleryImportDialog } from "./components/canvas-prompt-gall
 import { CanvasTemplateDialog, type CanvasTemplate } from "./components/canvas-template-dialog";
 import { CanvasContextMenu } from "./components/canvas-context-menu";
 import { CanvasConfigNodePanel } from "./components/canvas-config-node-panel";
+import { CanvasBatchGenerationDialog, CanvasGenerationPreviewDialog, type CanvasBatchPreviewItem } from "./components/canvas-generation-preview-dialog";
+import { CanvasNodeSearchDialog } from "./components/canvas-node-search-dialog";
 import { FullscreenImageViewer } from "./components/fullscreen-image-viewer";
 import type { ImageActionPayload } from "@/lib/image-actions";
 import { CanvasCropDialog, CanvasUpscaleDialog, CanvasSplitDialog, CanvasAngleDialog } from "./components/canvas-node-dialogs";
 import { canvasTheme } from "./lib/canvas-theme";
 import { getNodeSpec } from "./constants";
-import { useCanvasStore } from "./stores/use-canvas-store";
+import { flushPendingCanvasSave, useCanvasStore } from "./stores/use-canvas-store";
 import { useCanvasConfigStore } from "./stores/use-canvas-config-store";
 import { CanvasApiKeyMissingError, submitNodeGeneration, pollNodeTask, checkExistingTask, type CanvasGeneratedImage } from "./canvas-generation-service";
 import { buildNodeGenerationContext, buildNodeGenerationInputs, hydrateNodeGenerationContext } from "./components/canvas-node-generation";
@@ -32,8 +34,14 @@ import { buildNodeMentionReferences } from "./utils/canvas-resource-references";
 import { fitNodeSize } from "./utils/canvas-node-size";
 import { getImageBlob, imageToDataUrl, resolveImageUrl, uploadImage, type UploadedImage } from "./lib/image-storage";
 import { imageReferenceLabel } from "./lib/image-reference-prompt";
+import {
+  enumeratePromptRoutes,
+  findSelectedPromptRoute,
+  isInvalidPromptRouteSelection,
+  MANUAL_PROMPT_ROUTE_VALUE,
+} from "./lib/canvas-prompt-routes";
 import { compressReferenceDataUrl, readFileAsDataUrl } from "./lib/image-utils";
-import { CanvasNodeType, type CanvasConnection, type CanvasGenerationConfig, type CanvasNodeData, type CanvasNodeMetadata, type ContextMenuState, type ConnectionHandle, type Position, type SelectionBox, type ViewportTransform } from "./types";
+import { CanvasNodeType, type CanvasConnection, type CanvasGenerationConfig, type CanvasInteractionMode, type CanvasNodeData, type CanvasNodeMetadata, type ContextMenuState, type ConnectionHandle, type Position, type SelectionBox, type ViewportTransform } from "./types";
 import type { ReferenceImage } from "./types-media";
 import { PromptOptimizeDialog } from "@/components/PromptOptimizeDialog";
 import { AiTextGenerateDialog } from "./components/canvas-ai-text-dialog";
@@ -44,6 +52,8 @@ import { readSseStream } from "@/lib/sse-stream-parser";
 import { MODEL_IMAGE_LIMITS } from "@/lib/gemini-config";
 import { normalizeModel } from "@/lib/model-capabilities";
 import type { PromptWithKey } from "@/lib/prompt-gallery-data";
+import { duplicateCanvasSelection } from "./utils/canvas-clipboard";
+import { arrangeCanvasNodes, layoutCanvasGraph, type CanvasArrangeMode } from "./utils/canvas-layout";
 
 type DialogState = { type: "crop" | "split" | "upscale" | "angle"; nodeId: string; source: string } | null;
 
@@ -58,6 +68,22 @@ type CanvasEditorProps = {
 };
 
 const MAX_HISTORY = 50;
+
+function connectedNodeIds(seedId: string, connections: CanvasConnection[]) {
+  const visited = new Set([seedId]);
+  const queue = [seedId];
+  while (queue.length) {
+    const id = queue.shift()!;
+    for (const connection of connections) {
+      const next = connection.fromNodeId === id ? connection.toNodeId : connection.toNodeId === id ? connection.fromNodeId : null;
+      if (next && !visited.has(next)) {
+        visited.add(next);
+        queue.push(next);
+      }
+    }
+  }
+  return [...visited];
+}
 
 /**
  * 构建AI文本生成的系统提示词
@@ -210,6 +236,7 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
   const theme = canvasTheme;
   const openProject = useCanvasStore((state) => state.openProject);
   const updateProject = useCanvasStore((state) => state.updateProject);
+  const saveStatus = useCanvasStore((state) => state.saveStatus);
   const renameProject = useCanvasStore((state) => state.renameProject);
   const projectTitle = useCanvasStore((state) => state.projects.find((item) => item.id === projectId)?.title) ?? "画布";
   const defaultConfig = useCanvasConfigStore((state) => state.config);
@@ -222,8 +249,10 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
   const [viewport, setViewport] = useState<ViewportTransform>(() => project?.viewport ?? { x: 0, y: 0, k: 1 });
   const [backgroundMode, setBackgroundMode] = useState(project?.backgroundMode ?? "lines");
   const [showImageInfo, setShowImageInfo] = useState(project?.showImageInfo ?? false);
+  const [interactionMode, setInteractionMode] = useState<CanvasInteractionMode>("select");
 
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [selectedConnectionId, setSelectedConnectionId] = useState<string | null>(null);
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [connecting, setConnecting] = useState<{ handle: ConnectionHandle; mouseWorld: Position; targetId?: string } | null>(null);
   const [selectionBox, setSelectionBox] = useState<SelectionBox | null>(null);
@@ -247,6 +276,9 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
   const [replaceConfirm, setReplaceConfirm] = useState<{ nodeId: string; stored: UploadedImage } | null>(null);
   const [textReplaceConfirm, setTextReplaceConfirm] = useState<{ nodeId: string; content: string } | null>(null);
   const [fullscreenImageUrl, setFullscreenImageUrl] = useState<{ src: string; title: string; actionPayload?: ImageActionPayload } | null>(null);
+  const [generationPreviewNodeId, setGenerationPreviewNodeId] = useState<string | null>(null);
+  const [batchGenerationOpen, setBatchGenerationOpen] = useState(false);
+  const [nodeSearchOpen, setNodeSearchOpen] = useState(false);
   const [nodeZIndexMap, setNodeZIndexMap] = useState<Record<string, number>>({});
   const topZIndexRef = useRef(1);
 
@@ -261,12 +293,13 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
     | null
   >(null);
   const gestureActive = useRef(false);
-  const clipboard = useRef<CanvasNodeData[]>([]);
+  const clipboard = useRef<{ nodes: CanvasNodeData[]; connections: CanvasConnection[] }>({ nodes: [], connections: [] });
   const activeGenerationsRef = useRef<Map<string, AbortController>>(new Map());
   const retryCooldownRef = useRef<Map<string, number>>(new Map());
   const textGenerationControllersRef = useRef<Map<string, AbortController>>(new Map());
   const [undoStack, setUndoStack] = useState<HistorySnapshot[]>([]);
   const [redoStack, setRedoStack] = useState<HistorySnapshot[]>([]);
+  const continuousHistoryTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
 
   // 提示词优化（结合连接的上游图片/文字引用）
   const [optimizeOpen, setOptimizeOpen] = useState(false);
@@ -277,11 +310,24 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
   const [optimizeOriginalPrompt, setOptimizeOriginalPrompt] = useState("");
   const optimizeHandleRef = useRef<StreamPromptOptimizeHandle | null>(null);
 
-  // ---- persistence: sync local state to store (store debounces IndexedDB writes) ----
+  // ---- persistence: content changes affect updatedAt; view-only changes do not ----
   useEffect(() => {
     if (!project) return;
-    updateProject(projectId, { nodes, connections, viewport, backgroundMode, showImageInfo });
-  }, [nodes, connections, viewport, backgroundMode, showImageInfo, project, projectId, updateProject]);
+    updateProject(projectId, { nodes, connections });
+  }, [nodes, connections, project, projectId, updateProject]);
+
+  useEffect(() => {
+    if (!project) return;
+    updateProject(projectId, { viewport, backgroundMode, showImageInfo }, { touchUpdatedAt: false });
+  }, [viewport, backgroundMode, showImageInfo, project, projectId, updateProject]);
+
+  useEffect(() => {
+    const flushWhenHidden = () => {
+      if (document.visibilityState === "hidden") void flushPendingCanvasSave();
+    };
+    document.addEventListener("visibilitychange", flushWhenHidden);
+    return () => document.removeEventListener("visibilitychange", flushWhenHidden);
+  }, []);
 
   // ---- resolve image blob URLs for nodes that only have a storageKey ----
   useEffect(() => {
@@ -342,6 +388,17 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
     });
     setRedoStack([]);
   }, [snapshot]);
+  const clearContinuousHistory = useCallback(() => {
+    continuousHistoryTimersRef.current.forEach((timer) => clearTimeout(timer));
+    continuousHistoryTimersRef.current.clear();
+  }, []);
+  const recordContinuousHistory = useCallback((key: string) => {
+    const currentTimer = continuousHistoryTimersRef.current.get(key);
+    if (!currentTimer) pushHistory();
+    else clearTimeout(currentTimer);
+    continuousHistoryTimersRef.current.set(key, setTimeout(() => continuousHistoryTimersRef.current.delete(key), 600));
+  }, [pushHistory]);
+  useEffect(() => clearContinuousHistory, [clearContinuousHistory]);
   const beginGesture = useCallback(() => {
     if (gestureActive.current) return;
     gestureActive.current = true;
@@ -349,20 +406,22 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
   }, [pushHistory]);
   const undo = useCallback(() => {
     if (!undoStack.length) return;
+    clearContinuousHistory();
     const previous = undoStack[undoStack.length - 1];
     setRedoStack((redo) => [...redo, snapshot()]);
     setUndoStack((stack) => stack.slice(0, -1));
     setNodes(previous.nodes);
     setConnections(previous.connections);
-  }, [snapshot, undoStack]);
+  }, [clearContinuousHistory, snapshot, undoStack]);
   const redo = useCallback(() => {
     if (!redoStack.length) return;
+    clearContinuousHistory();
     const next = redoStack[redoStack.length - 1];
     setUndoStack((stack) => [...stack, snapshot()]);
     setRedoStack((redo) => redo.slice(0, -1));
     setNodes(next.nodes);
     setConnections(next.connections);
-  }, [snapshot, redoStack]);
+  }, [clearContinuousHistory, snapshot, redoStack]);
 
   const worldFromClient = useCallback(
     (clientX: number, clientY: number): Position => {
@@ -401,10 +460,10 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
   }, []);
 
   const addNode = useCallback(
-    (type: CanvasNodeType) => {
+    (type: CanvasNodeType, position?: Position) => {
       pushHistory();
       const spec = getNodeSpec(type);
-      const center = viewportCenterWorld();
+      const center = position ?? viewportCenterWorld();
       const metadata: CanvasNodeMetadata = { ...spec.metadata };
       if (type === CanvasNodeType.Config) metadata.genConfig = defaultConfig;
       const node: CanvasNodeData = {
@@ -417,6 +476,7 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
         metadata,
       };
       setNodes((prev) => [...prev, node]);
+      setSelectedConnectionId(null);
       setSelectedIds([node.id]);
     },
     [defaultConfig, pushHistory, viewportCenterWorld],
@@ -429,22 +489,46 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
       const idSet = new Set(ids);
       setNodes((prev) => prev.filter((node) => !idSet.has(node.id)));
       setConnections((prev) => prev.filter((connection) => !idSet.has(connection.fromNodeId) && !idSet.has(connection.toNodeId)));
+      setSelectedConnectionId(null);
       setSelectedIds((prev) => prev.filter((id) => !idSet.has(id)));
+    },
+    [pushHistory],
+  );
+
+  const pasteClipboardAt = useCallback((position: Position) => {
+    if (!clipboard.current.nodes.length) return;
+    const duplicated = duplicateCanvasSelection(clipboard.current.nodes, clipboard.current.connections, clipboard.current.nodes.map((node) => node.id), nanoid, 0);
+    const minX = Math.min(...duplicated.nodes.map((node) => node.position.x));
+    const minY = Math.min(...duplicated.nodes.map((node) => node.position.y));
+    const placedNodes = duplicated.nodes.map((node) => ({ ...node, position: { x: node.position.x - minX + position.x, y: node.position.y - minY + position.y } }));
+    pushHistory();
+    setNodes((current) => [...current, ...placedNodes]);
+    setConnections((current) => [...current, ...duplicated.connections]);
+    setSelectedIds(placedNodes.map((node) => node.id));
+    setSelectedConnectionId(null);
+  }, [pushHistory]);
+
+  const deleteConnection = useCallback(
+    (connectionId: string | null) => {
+      if (!connectionId) return;
+      pushHistory();
+      setConnections((prev) => prev.filter((connection) => connection.id !== connectionId));
+      setSelectedConnectionId((selectedId) => (selectedId === connectionId ? null : selectedId));
     },
     [pushHistory],
   );
 
   const duplicateNodes = useCallback(
     (ids: string[]) => {
-      const idSet = new Set(ids);
-      const sources = nodes.filter((node) => idSet.has(node.id));
-      if (!sources.length) return;
+      const duplicated = duplicateCanvasSelection(nodes, connections, ids, nanoid, 32);
+      if (!duplicated.nodes.length) return;
       pushHistory();
-      const clones = sources.map((node) => ({ ...node, id: nanoid(), position: { x: node.position.x + 32, y: node.position.y + 32 }, metadata: { ...node.metadata } }));
-      setNodes((prev) => [...prev, ...clones]);
-      setSelectedIds(clones.map((node) => node.id));
+      setNodes((prev) => [...prev, ...duplicated.nodes]);
+      setConnections((prev) => [...prev, ...duplicated.connections]);
+      setSelectedConnectionId(null);
+      setSelectedIds(duplicated.nodes.map((node) => node.id));
     },
-    [nodes, pushHistory],
+    [connections, nodes, pushHistory],
   );
 
   // ---- image source: upload / asset library / save to assets ----
@@ -663,6 +747,7 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
         pushHistory();
         setNodes((prev) => [...prev, ...upstreamNodes, configNode]);
         setConnections((prev) => [...prev, ...newConnections]);
+        setSelectedConnectionId(null);
         setSelectedIds([configNode.id]);
         setPromptGalleryOpen(false);
         showToast(
@@ -715,6 +800,7 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
       pushHistory();
       setNodes((prev) => [...prev, textNode, configNode]);
       setConnections((prev) => [...prev, connection]);
+      setSelectedConnectionId(null);
       setSelectedIds([configNode.id]);
       setTemplateOpen(false);
       showToast(`已导入模板：${template.title}`, "success");
@@ -761,6 +847,34 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
     },
     [connections, defaultConfig, nodes],
   );
+
+  const selectedConfigNodes = useMemo(
+    () => nodes.filter((node) => selectedIds.includes(node.id) && node.type === CanvasNodeType.Config),
+    [nodes, selectedIds],
+  );
+  const previewNode = useMemo(
+    () => nodes.find((node) => node.id === generationPreviewNodeId && node.type === CanvasNodeType.Config) ?? null,
+    [generationPreviewNodeId, nodes],
+  );
+  const previewContext = useMemo(() => previewNode
+    ? buildNodeGenerationContext(previewNode.id, nodes, connections, previewNode.metadata?.composerContent ?? previewNode.metadata?.prompt ?? "")
+    : null, [connections, nodes, previewNode]);
+  const batchPreviewItems = useMemo<CanvasBatchPreviewItem[]>(() => selectedConfigNodes.map((node) => {
+    const prompt = node.metadata?.composerContent ?? node.metadata?.prompt ?? "";
+    const context = buildNodeGenerationContext(node.id, nodes, connections, prompt);
+    const limit = getConfigReferenceLimit(node);
+    const config = node.metadata?.genConfig ?? defaultConfig;
+    const reason = !context.routeValid
+      ? "路线已失效"
+      : !context.prompt.trim()
+        ? "提示词为空"
+        : limit.exceeded
+          ? "参考图超限"
+          : busyNodeIds.includes(node.id)
+            ? "正在生成"
+            : undefined;
+    return { node, valid: !reason, reason, imageCount: Number(config.count) || 1 };
+  }), [busyNodeIds, connections, defaultConfig, getConfigReferenceLimit, nodes, selectedConfigNodes]);
 
   // 对单个结果图片节点启动独立生成任务（提交 + 轮询）。
   const startNodeGeneration = useCallback(
@@ -817,11 +931,12 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
   const runGeneration = useCallback(
     async (sourceNode: CanvasNodeData) => {
       const promptText = (sourceNode.metadata?.composerContent ?? sourceNode.metadata?.prompt ?? "").trim();
-      if (!promptText) { showToast("请输入提示词", "info"); return; }
       const genConfig: CanvasGenerationConfig = sourceNode.metadata?.genConfig ?? defaultConfig;
       const locked = Boolean(sourceNode.metadata?.lockResultNodes);
       const count = genConfig.count;
       const context = buildNodeGenerationContext(sourceNode.id, nodes, connections, promptText);
+      if (!context.routeValid) { showToast("所选提示词路线已失效，请重新选择", "error"); return; }
+      if (!context.prompt.trim()) { showToast("请输入提示词", "info"); return; }
       const model = normalizeModel(genConfig.model);
       const maxReferenceImages = typeof MODEL_IMAGE_LIMITS[model]?.max === "number" ? MODEL_IMAGE_LIMITS[model].max : 1;
 
@@ -851,7 +966,11 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
         if (targetIds.length < count) {
           const needed = count - targetIds.length;
           for (let i = 0; i < needed; i++) {
-            const node = createImageNode({ x: sourceNode.position.x + sourceNode.width + 80 + (targetIds.length + i) * 400, y: sourceNode.position.y + sourceNode.height + 60 });
+            const resultIndex = targetIds.length + 1;
+            const node = createImageNode(
+              { x: sourceNode.position.x + sourceNode.width + 80 + (resultIndex - 1) * 400, y: sourceNode.position.y + sourceNode.height + 60 },
+              { title: `${sourceNode.title} - 结果 ${resultIndex}` },
+            );
             targetIds.push(node.id);
             newConnections.push({ id: nanoid(), fromNodeId: sourceNode.id, toNodeId: node.id });
             setNodes((prev) => [...prev, node]);
@@ -863,7 +982,10 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
       } else {
         // 非锁定模式：新建 count 个结果节点
         for (let i = 0; i < count; i++) {
-          const node = createImageNode({ x: sourceNode.position.x + sourceNode.width + 80 + i * 400, y: sourceNode.position.y });
+          const node = createImageNode(
+            { x: sourceNode.position.x + sourceNode.width + 80 + i * 400, y: sourceNode.position.y },
+            { title: `${sourceNode.title} - 结果 ${i + 1}` },
+          );
           targetIds.push(node.id);
           newConnections.push({ id: nanoid(), fromNodeId: sourceNode.id, toNodeId: node.id });
           setNodes((prev) => [...prev, node]);
@@ -898,10 +1020,13 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
       const sourceNode = configConnection ? nodes.find((n) => n.id === configConnection.fromNodeId) : undefined;
       const promptText = sourceNode?.metadata?.composerContent ?? sourceNode?.metadata?.prompt ?? node.metadata?.prompt ?? "";
       const genConfig = sourceNode?.metadata?.genConfig ?? defaultConfig;
-      if (!promptText) { showToast("无法获取提示词", "info"); return; }
 
       void (async () => {
-        const context = sourceNode ? buildNodeGenerationContext(sourceNode.id, nodes, connections, promptText) : { prompt: promptText, referenceImages: [], textCount: 0, imageCount: 0 };
+        const context = sourceNode
+          ? buildNodeGenerationContext(sourceNode.id, nodes, connections, promptText)
+          : { prompt: promptText, referenceImages: [], textCount: 0, imageCount: 0, routeValid: true };
+        if (!context.routeValid) { showToast("所选提示词路线已失效，请重新选择", "error"); return; }
+        if (!context.prompt.trim()) { showToast("无法获取提示词", "info"); return; }
         const hydrated = await hydrateNodeGenerationContext(context);
         void startNodeGeneration(node.id, hydrated.prompt || promptText, hydrated.referenceImages, genConfig, sourceNode?.id ?? "");
       })();
@@ -1033,6 +1158,7 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
     (event: React.PointerEvent, nodeId: string) => {
       if (event.button !== 0) return;
       event.stopPropagation();
+      setSelectedConnectionId(null);
       setContextMenu(null); // 点击节点时关闭右键菜单
 
       // 点击节点时自动置顶（Fix 2: z-index stacking）
@@ -1088,7 +1214,7 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
 
   const handleCanvasSelectionStart = useCallback(
     (event: React.PointerEvent) => {
-      const additive = event.shiftKey;
+      const additive = event.shiftKey || event.ctrlKey || event.metaKey;
       const world = worldFromClient(event.clientX, event.clientY);
       interaction.current = { kind: "selection", additive, initial: additive ? selectedIds : [] };
       setSelectionBox({ startWorldX: world.x, startWorldY: world.y, currentWorldX: world.x, currentWorldY: world.y, additive, initialSelectedNodeIds: additive ? selectedIds : [] });
@@ -1133,16 +1259,27 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
       }
     };
 
-    const handleUp = () => {
+    const handleUp = (event: PointerEvent) => {
       const current = interaction.current;
       if (current?.kind === "connect") {
         setConnecting((conn) => {
           if (conn?.targetId) {
             const from = current.handle.handleType === "source" ? current.handle.nodeId : conn.targetId;
             const to = current.handle.handleType === "source" ? conn.targetId : current.handle.nodeId;
-            if (from !== to) {
-              setConnections((prev) => (prev.some((item) => item.fromNodeId === from && item.toNodeId === to) ? prev : [...prev, { id: nanoid(), fromNodeId: from, toNodeId: to }]));
+            if (from !== to && !connections.some((item) => item.fromNodeId === from && item.toNodeId === to)) {
+              pushHistory();
+              setConnections((prev) => [...prev, { id: nanoid(), fromNodeId: from, toNodeId: to }]);
             }
+          } else {
+            // 拖到空白处松开 → 弹出连线创建菜单
+            setContextMenu({
+              type: "connection-create",
+              x: event.clientX,
+              y: event.clientY,
+              position: worldFromClient(event.clientX, event.clientY),
+              sourceNodeId: current.handle.nodeId,
+              handleType: current.handle.handleType,
+            });
           }
           return null;
         });
@@ -1154,7 +1291,14 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
             const minY = Math.min(box.startWorldY, box.currentWorldY);
             const maxY = Math.max(box.startWorldY, box.currentWorldY);
             const inside = nodes.filter((node) => node.position.x + node.width >= minX && node.position.x <= maxX && node.position.y + node.height >= minY && node.position.y <= maxY).map((node) => node.id);
-            setSelectedIds([...new Set([...box.initialSelectedNodeIds, ...inside])]);
+            setSelectedConnectionId(null);
+            if (box.additive) {
+              const next = new Set(box.initialSelectedNodeIds);
+              inside.forEach((id) => next.has(id) ? next.delete(id) : next.add(id));
+              setSelectedIds([...next]);
+            } else {
+              setSelectedIds(inside);
+            }
           }
           return null;
         });
@@ -1169,7 +1313,7 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
       window.removeEventListener("pointermove", handleMove);
       window.removeEventListener("pointerup", handleUp);
     };
-  }, [nodes, viewport.k, worldFromClient]);
+  }, [connections, nodes, pushHistory, viewport.k, worldFromClient]);
 
   // ---- keyboard ----
   useEffect(() => {
@@ -1187,20 +1331,35 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
         return;
       }
       if (editing) return;
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        setNodeSearchOpen(true);
+        return;
+      }
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "c") {
-        clipboard.current = nodes.filter((node) => selectedIds.includes(node.id)).map((node) => ({ ...node, metadata: { ...node.metadata } }));
+        const selectedSet = new Set(selectedIds);
+        clipboard.current = {
+          nodes: nodes.filter((node) => selectedSet.has(node.id)).map((node) => ({ ...node, metadata: { ...node.metadata } })),
+          connections: connections.filter((connection) => selectedSet.has(connection.fromNodeId) && selectedSet.has(connection.toNodeId)).map((connection) => ({ ...connection })),
+        };
         return;
       }
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "v") {
-        if (!clipboard.current.length) return;
+        if (!clipboard.current.nodes.length) return;
+        event.preventDefault();
         pushHistory();
-        const clones = clipboard.current.map((node) => ({ ...node, id: nanoid(), position: { x: node.position.x + 40, y: node.position.y + 40 }, metadata: { ...node.metadata } }));
-        setNodes((prev) => [...prev, ...clones]);
-        setSelectedIds(clones.map((node) => node.id));
+        const duplicated = duplicateCanvasSelection(clipboard.current.nodes, clipboard.current.connections, clipboard.current.nodes.map((node) => node.id), nanoid, 40);
+        setNodes((prev) => [...prev, ...duplicated.nodes]);
+        setConnections((prev) => [...prev, ...duplicated.connections]);
+        setSelectedConnectionId(null);
+        setSelectedIds(duplicated.nodes.map((node) => node.id));
         return;
       }
       if (event.key === "Delete" || event.key === "Backspace") {
-        if (selectedIds.length) {
+        if (selectedConnectionId) {
+          event.preventDefault();
+          deleteConnection(selectedConnectionId);
+        } else if (selectedIds.length) {
           event.preventDefault();
           deleteNodes(selectedIds);
         }
@@ -1208,7 +1367,7 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [deleteNodes, nodes, pushHistory, redo, selectedIds, undo]);
+  }, [connections, deleteConnection, deleteNodes, nodes, pushHistory, redo, selectedConnectionId, selectedIds, undo]);
 
   // ---- 粘贴图片/文本：选中单个同类节点则填充，否则在视口中心新建 ----
   useEffect(() => {
@@ -1241,6 +1400,7 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
           const size = fitNodeSize(stored.width, stored.height, 320, 320);
           const node = createImageNode(viewportCenterWorld(), { metadata: storedToMetadata(stored), width: size.width, height: size.height });
           setNodes((prev) => [...prev, node]);
+          setSelectedConnectionId(null);
           setSelectedIds([node.id]);
         } catch {
           showToast("粘贴图片失败", "error");
@@ -1274,6 +1434,7 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
       pushHistory();
       const node = createTextNode(viewportCenterWorld(), text);
       setNodes((prev) => [...prev, node]);
+      setSelectedConnectionId(null);
       setSelectedIds([node.id]);
     };
     window.addEventListener("paste", handlePasteText);
@@ -1289,23 +1450,70 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
     return set;
   }, [connections, selectedIds]);
 
+  const activePromptRoute = useMemo(() => {
+    if (selectedIds.length !== 1) return null;
+    const selectedNode = nodes.find((node) => node.id === selectedIds[0]);
+    if (selectedNode?.type !== CanvasNodeType.Config) return null;
+    const routes = enumeratePromptRoutes(selectedNode.id, nodes, connections).routes;
+    return findSelectedPromptRoute(selectedNode.metadata?.promptRouteSelection, routes);
+  }, [connections, nodes, selectedIds]);
+  const activeRouteNodeIds = useMemo(() => new Set(activePromptRoute?.nodeIds ?? []), [activePromptRoute]);
+  const activeRouteConnectionIds = useMemo(() => new Set(activePromptRoute?.connectionIds ?? []), [activePromptRoute]);
+
   const nodeById = useCallback((id: string) => nodes.find((node) => node.id === id), [nodes]);
   const contextNode = contextMenu?.type === "node" ? nodeById(contextMenu.nodeId) : undefined;
 
+  const focusNode = useCallback((node: CanvasNodeData) => {
+    const scale = Math.min(Math.max(viewport.k, 0.5), 1.25);
+    setViewport({
+      x: viewportSize.width / 2 - (node.position.x + node.width / 2) * scale,
+      y: viewportSize.height / 2 - (node.position.y + node.height / 2) * scale,
+      k: scale,
+    });
+    setSelectedConnectionId(null);
+    setSelectedIds([node.id]);
+  }, [viewport.k, viewportSize.height, viewportSize.width]);
+
   const handleTextChange = useCallback(
     (nodeId: string, content: string) => {
+      recordContinuousHistory(`text:${nodeId}`);
       patchNode(nodeId, (node) => ({ ...node, metadata: { ...node.metadata, content } }));
     },
-    [patchNode],
+    [patchNode, recordContinuousHistory],
   );
+
+  const runSelectedGenerations = useCallback(() => {
+    const validNodes = batchPreviewItems.filter((item) => item.valid).map((item) => item.node);
+    setBatchGenerationOpen(false);
+    validNodes.forEach((node) => void runGeneration(node));
+  }, [batchPreviewItems, runGeneration]);
 
   const handleConfigChange = useCallback(
     (nodeId: string, patch: Partial<CanvasGenerationConfig>) => {
+      recordContinuousHistory(`config:${nodeId}`);
       patchNode(nodeId, (node) => ({ ...node, metadata: { ...node.metadata, genConfig: { ...(node.metadata?.genConfig ?? defaultConfig), ...patch } } }));
       setStoreConfig(patch);
     },
-    [defaultConfig, patchNode, setStoreConfig],
+    [defaultConfig, patchNode, recordContinuousHistory, setStoreConfig],
   );
+
+  const handleArrange = useCallback((mode: CanvasArrangeMode | "graph") => {
+    const targetIds = mode === "graph"
+      ? selectedIds.length > 1
+        ? selectedIds
+        : selectedIds.length === 1
+          ? connectedNodeIds(selectedIds[0], connections)
+          : nodes.map((node) => node.id)
+      : selectedIds;
+    if (targetIds.length < 2) {
+      showToast("至少需要两个节点才能排列", "info");
+      return;
+    }
+    pushHistory();
+    setNodes((current) => mode === "graph"
+      ? layoutCanvasGraph(current, connections, targetIds)
+      : arrangeCanvasNodes(current, targetIds, mode));
+  }, [connections, nodes, pushHistory, selectedIds, showToast]);
 
   // ---- AI 文本生成对话框逻辑 ----
   const handleAiTextOpen = useCallback((nodeId: string) => {
@@ -1396,6 +1604,7 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
     const nodeId = aiTextTargetNodeId;
     if (!nodeId || !aiTextGenerated) return;
 
+    pushHistory();
     patchNode(nodeId, (n) => ({
       ...n,
       metadata: {
@@ -1403,7 +1612,7 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
         content: aiTextGenerated,
       },
     }));
-  }, [aiTextTargetNodeId, aiTextGenerated, patchNode]);
+  }, [aiTextTargetNodeId, aiTextGenerated, patchNode, pushHistory]);
 
   const handleAiTextCancel = useCallback(() => {
     setAiTextDialogOpen(false);
@@ -1598,12 +1807,13 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
 
   const handleOptimizeAccept = useCallback(() => {
     if (optimizedText && optimizeNodeId) {
+      pushHistory();
       patchNode(optimizeNodeId, (node) => ({ ...node, metadata: { ...node.metadata, composerContent: optimizedText } }));
     }
     optimizeHandleRef.current = null;
     setOptimizedText("");
     setOptimizeError(null);
-  }, [optimizedText, optimizeNodeId, patchNode]);
+  }, [optimizedText, optimizeNodeId, patchNode, pushHistory]);
 
   const selectionRect = useMemo(() => {
     if (!selectionBox) return null;
@@ -1652,11 +1862,19 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
       <InfiniteCanvas
         containerRef={containerRef}
         viewport={viewport}
+        interactionMode={interactionMode}
         backgroundMode={backgroundMode}
         onViewportChange={setViewport}
         onCanvasMouseDown={handleCanvasSelectionStart}
-        onCanvasDeselect={() => { setSelectedIds([]); setContextMenu(null); if (titleDraft !== null) { renameProject(projectId, titleDraft); setTitleDraft(null); } }}
-        onContextMenu={(event) => event.preventDefault()}
+        onCanvasDeselect={() => { setSelectedIds([]); setSelectedConnectionId(null); setContextMenu(null); if (titleDraft !== null) { renameProject(projectId, titleDraft); setTitleDraft(null); } }}
+        onContextMenu={(event) => {
+          event.preventDefault();
+          const target = event.target instanceof Element ? event.target : null;
+          if (target?.closest("[data-node-id],[data-connection-id]")) return;
+          setSelectedIds([]);
+          setSelectedConnectionId(null);
+          setContextMenu({ type: "canvas", x: event.clientX, y: event.clientY, position: worldFromClient(event.clientX, event.clientY) });
+        }}
         onDrop={(event) => {
           event.preventDefault();
           if (event.dataTransfer?.files?.length) void ingestFiles(event.dataTransfer.files, worldFromClient(event.clientX, event.clientY));
@@ -1667,10 +1885,28 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
             const from = nodeById(connection.fromNodeId);
             const to = nodeById(connection.toNodeId);
             if (!from || !to) return null;
-            const active = selectedIds.includes(connection.fromNodeId) || selectedIds.includes(connection.toNodeId);
+            const endpointSelected = selectedIds.includes(connection.fromNodeId) || selectedIds.includes(connection.toNodeId);
+            const active = selectedConnectionId === connection.id || (!activePromptRoute && endpointSelected);
+            const routeActive = activeRouteConnectionIds.has(connection.id);
             return (
               <g key={connection.id} className="pointer-events-auto">
-                <ConnectionPath connection={connection} from={from} to={to} active={active} onSelect={() => undefined} onContextMenu={(event) => setContextMenu({ type: "connection", x: event.clientX, y: event.clientY, connectionId: connection.id })} />
+                <ConnectionPath
+                  connection={connection}
+                  from={from}
+                  to={to}
+                  active={active}
+                  routeActive={routeActive}
+                  onSelect={() => {
+                    setSelectedIds([]);
+                    setSelectedConnectionId(connection.id);
+                    setContextMenu(null);
+                  }}
+                  onContextMenu={(event) => {
+                    setSelectedIds([]);
+                    setSelectedConnectionId(connection.id);
+                    setContextMenu({ type: "connection", x: event.clientX, y: event.clientY, connectionId: connection.id });
+                  }}
+                />
               </g>
             );
           })}
@@ -1679,6 +1915,20 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
 
         {nodes.map((node) => {
           const referenceLimit = node.type === CanvasNodeType.Config ? getConfigReferenceLimit(node) : null;
+          const routeEnumeration = node.type === CanvasNodeType.Config
+            ? enumeratePromptRoutes(node.id, nodes, connections)
+            : { routes: [], truncated: false };
+          const routeSelection = node.metadata?.promptRouteSelection ?? { mode: "manual" as const };
+          const selectedRoute = findSelectedPromptRoute(routeSelection, routeEnumeration.routes);
+          const routeInvalid = isInvalidPromptRouteSelection(routeSelection, routeEnumeration.routes);
+          const routeValue = routeInvalid
+            ? "invalid"
+            : selectedRoute?.id ?? MANUAL_PROMPT_ROUTE_VALUE;
+          const routeOptions = [
+            { value: MANUAL_PROMPT_ROUTE_VALUE, label: "手动编排（@ 引用）" },
+            ...(routeInvalid ? [{ value: "invalid", label: "所选路线已失效，请重新选择", disabled: true }] : []),
+            ...routeEnumeration.routes.map((route) => ({ value: route.id, label: route.label })),
+          ];
           return (
             <CanvasNode
               key={node.id}
@@ -1686,19 +1936,25 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
               imageUrl={nodeImageUrl(node)}
               isSelected={selectedIds.includes(node.id)}
               isRelated={relatedIds.has(node.id)}
+              isRouteActive={activeRouteNodeIds.has(node.id)}
               isConnectionTarget={connecting?.targetId === node.id}
               referenceLimitExceeded={Boolean(referenceLimit?.exceeded)}
               zIndex={nodeZIndexMap[node.id] ?? 1}
               showImageInfo={showImageInfo}
               onPointerDownNode={handleNodePointerDown}
-              onSelectNode={(id) => { if (!selectedIds.includes(id)) setSelectedIds([id]); }}
+              onSelectNode={(id) => { setSelectedConnectionId(null); if (!selectedIds.includes(id)) setSelectedIds([id]); }}
               onContextMenu={(event, id) => {
                 event.preventDefault();
+                setSelectedConnectionId(null);
                 if (!selectedIds.includes(id)) setSelectedIds([id]);
                 setContextMenu({ type: "node", x: event.clientX, y: event.clientY, nodeId: id });
               }}
               onConnectStart={handleConnectStart}
               onResizeStart={handleResizeStart}
+              onTitleChange={(nodeId, title) => {
+                pushHistory();
+                patchNode(nodeId, (current) => ({ ...current, title }));
+              }}
               onContentChange={handleTextChange}
               onUploadToNode={handleNodeUpload}
               onImportToNode={handleNodeImport}
@@ -1723,6 +1979,7 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
                 }
               }}
               onToggleRenderMode={(nodeId) => {
+                pushHistory();
                 patchNode(nodeId, (n) => ({
                   ...n,
                   metadata: { ...n.metadata, renderMode: n.metadata?.renderMode === "markdown" ? "plain" : "markdown" },
@@ -1736,13 +1993,37 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
                   config={configNode.metadata?.genConfig ?? defaultConfig}
                   lockResultNodes={Boolean(configNode.metadata?.lockResultNodes)}
                   referenceLimit={referenceLimit ?? getConfigReferenceLimit(configNode)}
+                  routeValue={routeValue}
+                  routeOptions={routeOptions}
+                  routeInvalid={routeInvalid}
+                  routesTruncated={routeEnumeration.truncated}
                   busy={busyNodeIds.includes(configNode.id)}
                   optimizing={optimizing && optimizeNodeId === configNode.id}
-                  onPromptChange={(value) => patchNode(configNode.id, (n) => ({ ...n, metadata: { ...n.metadata, composerContent: value } }))}
+                  onPromptChange={(value) => {
+                    recordContinuousHistory(`prompt:${configNode.id}`);
+                    patchNode(configNode.id, (n) => ({ ...n, metadata: { ...n.metadata, composerContent: value } }));
+                  }}
                   onConfigChange={(patch) => handleConfigChange(configNode.id, patch)}
-                  onToggleLock={() => patchNode(configNode.id, (n) => ({ ...n, metadata: { ...n.metadata, lockResultNodes: !n.metadata?.lockResultNodes } }))}
+                  onToggleLock={() => {
+                    pushHistory();
+                    patchNode(configNode.id, (n) => ({ ...n, metadata: { ...n.metadata, lockResultNodes: !n.metadata?.lockResultNodes } }));
+                  }}
+                  onRouteChange={(value) => {
+                    pushHistory();
+                    if (value === MANUAL_PROMPT_ROUTE_VALUE) {
+                      patchNode(configNode.id, (n) => ({ ...n, metadata: { ...n.metadata, promptRouteSelection: { mode: "manual" } } }));
+                      return;
+                    }
+                    const route = routeEnumeration.routes.find((item) => item.id === value);
+                    if (!route) return;
+                    patchNode(configNode.id, (n) => ({
+                      ...n,
+                      metadata: { ...n.metadata, promptRouteSelection: { mode: "route", connectionIds: route.connectionIds } },
+                    }));
+                  }}
                   onSelect={onSelect}
                   onOptimizePrompt={() => void handleOptimizePrompt(configNode)}
+                  onPreview={() => setGenerationPreviewNodeId(configNode.id)}
                   onGenerate={() => void runGeneration(configNode)}
                 />
               )}
@@ -1760,7 +2041,13 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
 
       {/* 顶部返回 + 标题（点击重命名） */}
       <div data-canvas-no-zoom className="absolute top-4 left-4 z-50 flex items-center gap-2" onPointerDown={(event) => event.stopPropagation()}>
-        <Button variant="outline" size="sm" onClick={onBack}>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            void flushPendingCanvasSave().then(onBack);
+          }}
+        >
           <ArrowLeft className="size-4" />
           画布列表
         </Button>
@@ -1793,14 +2080,21 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
             {projectTitle}
           </button>
         )}
+        <span className="flex items-center gap-1 text-[11px] text-muted-foreground" aria-live="polite">
+          {saveStatus === "saving" ? <LoaderCircle className="size-3 animate-spin" /> : saveStatus === "error" ? <CloudAlert className="size-3 text-destructive" /> : <Check className="size-3" />}
+          {saveStatus === "saving" ? "保存中" : saveStatus === "error" ? "保存失败" : "已保存"}
+        </span>
       </div>
 
       <CanvasToolbar
-        selectedCount={selectedIds.length}
+        selectedCount={selectedIds.length + (selectedConnectionId ? 1 : 0)}
+        nodeCount={nodes.length}
+        selectedConfigCount={selectedConfigNodes.length}
         canUndo={undoStack.length > 0}
         canRedo={redoStack.length > 0}
         backgroundMode={backgroundMode}
         showImageInfo={showImageInfo}
+        interactionMode={interactionMode}
         showPromptGallery={showPromptGallery}
         onAddImage={() => addNode(CanvasNodeType.Image)}
         onAddText={() => addNode(CanvasNodeType.Text)}
@@ -1810,9 +2104,13 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
         onOpenTemplate={() => setTemplateOpen(true)}
         onUndo={undo}
         onRedo={redo}
-        onDelete={() => deleteNodes(selectedIds)}
+        onDelete={() => selectedConnectionId ? deleteConnection(selectedConnectionId) : deleteNodes(selectedIds)}
+        onArrange={handleArrange}
+        onGenerateSelected={() => setBatchGenerationOpen(true)}
+        onSearch={() => setNodeSearchOpen(true)}
         onBackgroundModeChange={setBackgroundMode}
         onShowImageInfoChange={setShowImageInfo}
+        onInteractionModeChange={setInteractionMode}
       />
 
       <CanvasZoomControls
@@ -1863,12 +2161,42 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
           onAngle: () => contextNode && openDialog("angle", contextNode),
           onDeleteConnection: () => {
             if (contextMenu?.type === "connection") {
-              pushHistory();
-              setConnections((prev) => prev.filter((connection) => connection.id !== contextMenu.connectionId));
+              deleteConnection(contextMenu.connectionId);
             }
           },
+          onAddNodeAt: (type) => {
+            if (contextMenu?.type === "canvas") addNode(type, contextMenu.position);
+          },
+          onConnectionCreate: (type) => {
+            if (contextMenu?.type !== "connection-create") return;
+            const { position, sourceNodeId, handleType } = contextMenu;
+            pushHistory();
+            const spec = getNodeSpec(type);
+            const metadata: CanvasNodeMetadata = { ...spec.metadata };
+            if (type === CanvasNodeType.Config) metadata.genConfig = defaultConfig;
+            const newNode: CanvasNodeData = {
+              id: nanoid(),
+              type,
+              title: spec.title,
+              position: { x: position.x - spec.width / 2, y: position.y - spec.height / 2 },
+              width: spec.width,
+              height: spec.height,
+              metadata,
+            };
+            const from = handleType === "source" ? sourceNodeId : newNode.id;
+            const to = handleType === "source" ? newNode.id : sourceNodeId;
+            setNodes((prev) => [...prev, newNode]);
+            setConnections((prev) => [...prev, { id: nanoid(), fromNodeId: from, toNodeId: to }]);
+            setSelectedConnectionId(null);
+            setSelectedIds([newNode.id]);
+          },
+          onPasteAt: () => {
+            if (contextMenu?.type === "canvas") pasteClipboardAt(contextMenu.position);
+          },
+          canPaste: clipboard.current.nodes.length > 0,
           onToggleRenderMode: contextNode?.type === CanvasNodeType.Text
             ? () => {
+                pushHistory();
                 patchNode(contextNode.id, (n) => ({
                   ...n,
                   metadata: { ...n.metadata, renderMode: n.metadata?.renderMode === "markdown" ? "plain" : "markdown" },
@@ -1877,6 +2205,7 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
             : undefined,
           onAnnotationChangeColor: contextNode?.type === CanvasNodeType.TextAnnotation
             ? () => {
+                pushHistory();
                 const colors = ["#fef3c7", "#dbeafe", "#fce7f3", "#d1fae5", "#fce4ec", "#ede9fe"];
                 const current = contextNode.metadata?.backgroundColor || "";
                 const next = colors[(colors.indexOf(current) + 1) % colors.length];
@@ -1888,6 +2217,7 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
             : undefined,
           onAnnotationChangeFontSize: contextNode?.type === CanvasNodeType.TextAnnotation
             ? () => {
+                pushHistory();
                 const sizes = [14, 16, 18, 20, 22, 24];
                 const current = contextNode.metadata?.fontSize || 14;
                 const next = sizes[(sizes.indexOf(current) + 1) % sizes.length];
@@ -1906,6 +2236,22 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
       <CanvasPromptGalleryImportDialog open={promptGalleryOpen} importing={promptGalleryImporting} onOpenChange={setPromptGalleryOpen} onConfirm={(prompt) => void importPromptGalleryTemplate(prompt)} />
 
       <CanvasTemplateDialog open={templateOpen} onOpenChange={setTemplateOpen} onConfirm={(template) => applyCanvasTemplate(template)} />
+
+      <CanvasGenerationPreviewDialog
+        open={Boolean(previewNode)}
+        onOpenChange={(open) => !open && setGenerationPreviewNodeId(null)}
+        node={previewNode}
+        context={previewContext}
+        config={previewNode?.metadata?.genConfig ?? defaultConfig}
+        onCopy={(text) => {
+          void navigator.clipboard?.writeText(text);
+          showToast("最终提示词已复制", "success");
+        }}
+      />
+
+      <CanvasBatchGenerationDialog open={batchGenerationOpen} onOpenChange={setBatchGenerationOpen} items={batchPreviewItems} onConfirm={runSelectedGenerations} />
+
+      <CanvasNodeSearchDialog open={nodeSearchOpen} onOpenChange={setNodeSearchOpen} nodes={nodes} onSelect={focusNode} />
 
       <PromptOptimizeDialog
         open={optimizeOpen}

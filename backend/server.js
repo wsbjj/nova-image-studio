@@ -108,6 +108,9 @@ const DB_PATH = process.env.NOVA_TASK_DB || path.join(__dirname, 'nova-tasks.sql
 const TASK_TTL_MS = 12 * 60 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+const IMAGE_STREAM_ENABLED = String(process.env.NOVA_IMAGE_STREAM ?? 'true').toLowerCase() !== 'false';
+const IMAGE_STREAM_PARTIAL_IMAGES = Math.min(3, Math.max(0, Number.parseInt(process.env.NOVA_IMAGE_PARTIAL_IMAGES || '1', 10) || 1));
+const IMAGE_STREAM_UNSUPPORTED_PATTERN = /(?:(?:stream|partial_images).*(?:unsupported|not supported|unknown|unrecognized|invalid)|(?:unsupported|not supported|unknown|unrecognized|invalid).*(?:stream|partial_images)|(?:stream|partial_images).*(?:不支持|未知|无效)|(?:不支持|未知|无效).*(?:stream|partial_images))/i;
 // 开源版：不再硬编码模型列表，由前端通过 protocol 字段指定协议类型
 const VALID_PROTOCOLS = new Set(['google', 'openai', 'grok']);
 const GPT_IMAGE_QUALITIES = new Set(['auto', 'high', 'medium', 'low']);
@@ -801,6 +804,7 @@ function createGptImageRequestInit(apiKey, request, resolvedSize, options = {}) 
   const prompt = request.prompt;
   const advancedParams = getGptImageRequestAdvancedParams(request);
   const stream = Boolean(options.stream);
+  const partialImages = Math.min(3, Math.max(0, Number(options.partialImages) || 0));
 
   if (request.mode === 'image-to-image') {
     const formData = new FormData();
@@ -809,6 +813,7 @@ function createGptImageRequestInit(apiKey, request, resolvedSize, options = {}) 
     formData.append('n', '1');
     if (stream) {
       formData.append('stream', 'true');
+      if (partialImages > 0) formData.append('partial_images', String(partialImages));
     }
     if (advancedParams) {
       formData.append('quality', advancedParams.quality);
@@ -842,7 +847,7 @@ function createGptImageRequestInit(apiKey, request, resolvedSize, options = {}) 
   const payload = {
     prompt,
     model: request.model,
-    ...(stream ? { stream: true } : {}),
+    ...(stream ? { stream: true, ...(partialImages > 0 ? { partial_images: partialImages } : {}) } : {}),
     ...(resolvedSize ? { size: resolvedSize } : {}),
     ...(advancedParams ? {
       quality: advancedParams.quality,
@@ -1031,6 +1036,11 @@ async function parseGptImageResponse(response) {
   if (errorMessage) throw new Error(errorMessage);
 
   return extractImagePayload(data);
+}
+
+function isImageStreamUnsupportedError(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return IMAGE_STREAM_UNSUPPORTED_PATTERN.test(message);
 }
 
 async function requestGptImage(apiKey, request, resolvedSize, options = {}) {
@@ -1411,7 +1421,21 @@ async function generateNovaImage(apiKey, request) {
   // 开源版：根据前端传入的 protocol 字段路由到对应的 API 协议
   const baseUrl = request.baseUrl || resolveNovaApiBaseUrl();
   if (request.protocol === 'openai') {
-    return requestGptImage(apiKey, request, resolveGptImageRequestSize(request), { baseUrl });
+    const resolvedSize = resolveGptImageRequestSize(request);
+    if (!IMAGE_STREAM_ENABLED) {
+      return requestGptImage(apiKey, request, resolvedSize, { baseUrl });
+    }
+    try {
+      return await requestGptImage(apiKey, request, resolvedSize, {
+        baseUrl,
+        stream: true,
+        partialImages: IMAGE_STREAM_PARTIAL_IMAGES,
+      });
+    } catch (error) {
+      if (!isImageStreamUnsupportedError(error)) throw error;
+      console.warn('[image-stream] 上游不支持图片流式参数，回退非流式请求');
+      return requestGptImage(apiKey, request, resolvedSize, { baseUrl });
+    }
   }
   if (request.protocol === 'grok') {
     return requestGrokImage(apiKey, request, { baseUrl });

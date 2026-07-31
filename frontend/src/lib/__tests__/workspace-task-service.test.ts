@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ackNovaTask, createNovaTask, resolveImageTaskProvider, type NovaTaskResponse } from '@/lib/ccode-task-client';
 import { downloadAndStoreImages } from '@/lib/image-downloader';
+import { syncDynamicModelExports } from '@/lib/gemini-config';
 import type { StoredJob } from '@/lib/job-store';
+import { saveRegistry } from '@/lib/nova-models';
 import {
   finalizeCompletedServerTask,
   submitTextToImage,
@@ -77,7 +79,7 @@ function createActions(initialJob: StoredJob): { actions: SubmitActions; getJob:
 
 beforeEach(() => {
   localStorage.clear();
-  localStorage.setItem('nova-model-registry', JSON.stringify({
+  saveRegistry({
     imageModels: [{
       id: 'gpt-image-2',
       protocol: 'openai',
@@ -99,7 +101,8 @@ beforeEach(() => {
       promptOptimize: '',
       imageDescribe: '',
     },
-  }));
+  });
+  syncDynamicModelExports();
   mockedAckNovaTask.mockReset();
   mockedAckNovaTask.mockResolvedValue(undefined);
   mockedCreateNovaTask.mockReset();
