@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { strFromU8, unzipSync } from 'fflate';
 import { BlobZipArchive, StreamingZipWriter } from '../backup-archive';
 
@@ -73,9 +73,13 @@ class WrappedCentralDirectoryBlob {
 }
 
 describe('backup archive ZIP reader/writer', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it('writes a ZIP that can be read by fflate and the streaming archive reader', async () => {
     const writer = new StreamingZipWriter();
-    writer.addJson('metadata.json', { appName: 'Nova Image' });
+    await writer.addJson('metadata.json', { appName: 'Nova Image' });
     await writer.addBlob('blobs/sample', new Blob([new Uint8Array([1, 2, 3, 4])], { type: 'image/png' }));
 
     const zip = await writer.finalize();
@@ -94,7 +98,7 @@ describe('backup archive ZIP reader/writer', () => {
 
   it('can recover a legacy archive whose central directory offset wrapped after 4GB', async () => {
     const writer = new StreamingZipWriter();
-    writer.addJson('metadata.json', { appName: 'Nova Image', wrapped: true });
+    await writer.addJson('metadata.json', { appName: 'Nova Image', wrapped: true });
     await writer.addBlob('blobs/sample', new Blob([new Uint8Array([9, 8, 7])]));
 
     const normalZip = await writer.finalize();
@@ -106,5 +110,25 @@ describe('backup archive ZIP reader/writer', () => {
     expect(JSON.parse((await archive.readText('metadata.json')) ?? '{}')).toMatchObject({ wrapped: true });
     const blob = await archive.readBlob('blobs/sample');
     expect(Array.from(await readBlob(blob!))).toEqual([9, 8, 7]);
+  });
+
+  it('encodes large JSON entries in bounded chunks', async () => {
+    const originalEncode = TextEncoder.prototype.encode;
+    const encodeSpy = vi.spyOn(TextEncoder.prototype, 'encode').mockImplementation(function (input = '') {
+      if (input.length > 64 * 1024) {
+        throw new DOMException('Failed to allocate buffer', 'EncodingError');
+      }
+      return originalEncode.call(this, input);
+    });
+    const payload = {
+      text: `${'a'.repeat(64 * 1024 - 1)}\ud83d\ude00${'b'.repeat(128 * 1024)}`,
+    };
+    const writer = new StreamingZipWriter();
+
+    await writer.addJson('large.json', payload);
+    const archive = await BlobZipArchive.open(await writer.finalize());
+
+    expect(JSON.parse((await archive.readText('large.json')) ?? '{}')).toEqual(payload);
+    expect(Math.max(...encodeSpy.mock.calls.map(([input = '']) => input.length))).toBeLessThanOrEqual(64 * 1024);
   });
 });

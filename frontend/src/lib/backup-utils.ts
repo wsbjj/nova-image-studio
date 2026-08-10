@@ -375,23 +375,23 @@ export async function exportAllData(onProgress?: ProgressCallback): Promise<Blob
     }
 
     // 添加元数据
-    writer.addJson('metadata.json', {
+    await writer.addJson('metadata.json', {
         version: process.env.NEXT_PUBLIC_APP_VERSION || '0.0.0',
         exportDate: new Date().toISOString(),
         appName: 'Nova Image',
     });
 
     // 添加 localStorage 数据
-    writer.addJson('localStorage.json', localStorageData);
+    await writer.addJson('localStorage.json', localStorageData);
 
     // 添加 IndexedDB 数据
     for (const [dbName, dbData] of Object.entries(indexedDBData)) {
-        writer.addJson(`indexedDB/${dbName}.json`, dbData);
+        await writer.addJson(`indexedDB/${dbName}.json`, dbData);
     }
 
     // 添加 localforage（无限画布）数据
     for (const [dbName, dbData] of Object.entries(localForageData)) {
-        writer.addJson(`localforage/${dbName}.json`, dbData);
+        await writer.addJson(`localforage/${dbName}.json`, dbData);
     }
 
     if (onProgress) {

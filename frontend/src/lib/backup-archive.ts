@@ -1,6 +1,6 @@
 'use client';
 
-import { inflateSync, strToU8 } from 'fflate';
+import { inflateSync } from 'fflate';
 
 const SIG_LOCAL_FILE_HEADER = 0x04034b50;
 const SIG_CENTRAL_FILE_HEADER = 0x02014b50;
@@ -18,6 +18,8 @@ const FLAG_DATA_DESCRIPTOR = 0x0008;
 const FLAG_UTF8 = 0x0800;
 const METHOD_STORE = 0;
 const METHOD_DEFLATE = 8;
+const TEXT_CHUNK_CODE_UNITS = 64 * 1024;
+const TEXT_CHUNKS_PER_YIELD = 16;
 
 type ZipRecord = {
     name: string;
@@ -101,6 +103,33 @@ function readUint64(view: DataView, offset: number): number {
 function makeBuffer(size: number): { bytes: Uint8Array; view: DataView } {
     const bytes = new Uint8Array(size);
     return { bytes, view: new DataView(bytes.buffer) };
+}
+
+function getUtf8ByteLength(text: string): number {
+    let length = 0;
+
+    for (let index = 0; index < text.length; index++) {
+        const code = text.charCodeAt(index);
+        if (code < 0x80) {
+            length += 1;
+        } else if (code < 0x800) {
+            length += 2;
+        } else if (code >= 0xd800 && code <= 0xdbff
+            && index + 1 < text.length
+            && text.charCodeAt(index + 1) >= 0xdc00
+            && text.charCodeAt(index + 1) <= 0xdfff) {
+            length += 4;
+            index++;
+        } else {
+            length += 3;
+        }
+    }
+
+    return length;
+}
+
+function yieldToEventLoop(): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 function getDosDateTime(date = new Date()): { modTime: number; modDate: number } {
@@ -246,8 +275,31 @@ export class StreamingZipWriter {
         this.endEntry(path, entry);
     }
 
-    addJson(path: string, data: unknown): void {
-        this.addBytes(path, strToU8(JSON.stringify(data)));
+    async addJson(path: string, data: unknown): Promise<void> {
+        const text = JSON.stringify(data);
+        const entry = this.beginEntry(path, getUtf8ByteLength(text));
+        let chunksWritten = 0;
+
+        for (let start = 0; start < text.length;) {
+            let end = Math.min(start + TEXT_CHUNK_CODE_UNITS, text.length);
+            if (end < text.length) {
+                const lastCode = text.charCodeAt(end - 1);
+                const nextCode = text.charCodeAt(end);
+                if (lastCode >= 0xd800 && lastCode <= 0xdbff && nextCode >= 0xdc00 && nextCode <= 0xdfff) {
+                    end--;
+                }
+            }
+
+            this.pushEntryChunk(entry, this.encoder.encode(text.slice(start, end)));
+            start = end;
+            chunksWritten++;
+
+            if (chunksWritten % TEXT_CHUNKS_PER_YIELD === 0) {
+                await yieldToEventLoop();
+            }
+        }
+
+        this.endEntry(path, entry);
     }
 
     async addBlob(path: string, blob: Blob): Promise<void> {
