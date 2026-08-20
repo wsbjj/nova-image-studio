@@ -9,6 +9,7 @@ import { GifGenerationWorkspace } from '@/components/GifGenerationWorkspace';
 import { AgentChatWorkspace } from '@/components/agent/AgentChatWorkspace';
 import { AssetsWorkspace } from '@/components/assets/AssetsWorkspace';
 import { CanvasWorkspace } from '@/components/canvas/CanvasWorkspace';
+import { SliceWorkspace } from '@/components/slice/SliceWorkspace';
 import { PromptGallery } from '@/components/PromptGallery';
 import { SettingsModal } from '@/components/SettingsModal';
 import { MissingApiKeyDialog } from '@/components/MissingApiKeyDialog';
@@ -51,7 +52,7 @@ export function WorkspaceShell() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [missingApiKeyDialogOpen, setMissingApiKeyDialogOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [activeTab, setActiveTab] = useState<'image-generation' | 'agent' | 'canvas' | 'assets' | 'reverse-prompt' | 'gif' | 'prompt-gallery'>('agent');
+  const [activeTab, setActiveTab] = useState<'image-generation' | 'agent' | 'canvas' | 'image-to-slice' | 'assets' | 'reverse-prompt' | 'gif' | 'prompt-gallery'>('agent');
   const [generationHistoryFilter, setGenerationHistoryFilter] = useState<GenerationHistoryFilter>('all');
   const [generationClearScope, setGenerationClearScope] = useState<HistoryClearScope | null>(null);
   const [referenceDraft, setReferenceDraft] = useState<{ id: number; refImages: RefImageData[]; prompt?: string } | null>(null);
@@ -405,6 +406,15 @@ export function WorkspaceShell() {
                   onEnableWideMode={() => { if (!wideMode) toggleWideMode(); }}
                   showToast={showToast}
                   showPromptGallery={promptGallery.showPromptGallery}
+                />
+              </TabsContent>
+
+              <TabsContent value="image-to-slice" keepMounted className={cn(wideMode ? 'space-y-6 xl:min-h-0 xl:flex xl:flex-col' : 'space-y-6')}>
+                <SliceWorkspace
+                  wideMode={wideMode}
+                  onConfigureApiKey={() => setSettingsOpen(true)}
+                  onEnableWideMode={() => { if (!wideMode) toggleWideMode(); }}
+                  showToast={showToast}
                 />
               </TabsContent>
 

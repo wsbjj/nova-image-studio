@@ -100,6 +100,9 @@ beforeEach(() => {
       agent: '',
       promptOptimize: '',
       imageDescribe: '',
+      sliceDecomposition: '',
+      sliceReconstruct: '',
+      sliceImageEdit: '',
     },
   });
   syncDynamicModelExports();

@@ -59,7 +59,32 @@ export interface DefaultModels {
   agent: string;
   promptOptimize: string;
   imageDescribe: string;
+  /** 图片切图的 AI 拆图（视觉定位切片与背景候选） */
+  sliceDecomposition: string;
+  /** 网页复刻 agent（多轮工具调用生成 HTML/CSS/JS） */
+  sliceReconstruct: string;
+  /**
+   * 切图的图片编辑能力（AI 透明化、背景补齐）。
+   * 与 textToImage / imageToImage 分开配置，因为这两项要求上游支持
+   * 带 mask 的 /v1/images/edits，只有 openai 协议的模型满足（见 isSliceCapableImageModel）。
+   */
+  sliceImageEdit: string;
 }
+
+/** 文本类默认模型的 task key。 */
+export type TextDefaultTask = keyof Pick<
+  DefaultModels,
+  'reversePrompt' | 'agent' | 'promptOptimize' | 'imageDescribe' | 'sliceDecomposition' | 'sliceReconstruct'
+>;
+
+const TEXT_DEFAULT_TASKS: TextDefaultTask[] = [
+  'reversePrompt',
+  'agent',
+  'promptOptimize',
+  'imageDescribe',
+  'sliceDecomposition',
+  'sliceReconstruct',
+];
 
 export interface NovaModelRegistry {
   imageModels: ImageModelConfig[];
@@ -199,6 +224,9 @@ export const DEFAULT_DEFAULTS: DefaultModels = {
   agent: '',
   promptOptimize: '',
   imageDescribe: '',
+  sliceDecomposition: '',
+  sliceReconstruct: '',
+  sliceImageEdit: '',
 };
 
 function isProviderProtocol(value: unknown): value is ProviderProtocol {
@@ -310,12 +338,35 @@ function ensureDefaults(raw: Partial<DefaultModels> | undefined, imageModels: Im
 
   if (!completeImageModels.some((model) => model.id === next.textToImage)) next.textToImage = firstImageModelId;
   if (!completeImageModels.some((model) => model.id === next.imageToImage)) next.imageToImage = firstImageModelId;
-  if (!completeTextModels.some((model) => model.id === next.reversePrompt)) next.reversePrompt = firstTextModelId;
-  if (!completeTextModels.some((model) => model.id === next.agent)) next.agent = firstTextModelId;
-  if (!completeTextModels.some((model) => model.id === next.promptOptimize)) next.promptOptimize = firstTextModelId;
-  if (!completeTextModels.some((model) => model.id === next.imageDescribe)) next.imageDescribe = firstTextModelId;
+  for (const task of TEXT_DEFAULT_TASKS) {
+    if (!completeTextModels.some((model) => model.id === next[task])) next[task] = firstTextModelId;
+  }
+
+  // 切图的图片编辑只能落在支持带 mask 编辑的模型上；没有这类模型时留空，
+  // 由 UI 提示用户去添加，而不是硬塞一个注定 400 的模型。
+  const sliceCapable = completeImageModels.filter(isSliceCapableImageModel);
+  if (!sliceCapable.some((model) => model.id === next.sliceImageEdit)) {
+    next.sliceImageEdit = sliceCapable[0]?.id || '';
+  }
 
   return next;
+}
+
+/**
+ * 该图片模型能否用于切图的图片编辑（AI 透明化 / 背景补齐）。
+ *
+ * 这两项都要打 `/v1/images/edits`，并且背景补齐还要传 `mask`。
+ * 只有 openai 协议的模型有这个端点：Gemini 走 generateContent 没有 mask 语义，
+ * Grok 的 edits 也不接受 mask 参数。所以在选择器层就把它们过滤掉，
+ * 而不是等请求 400 才告诉用户。
+ */
+export function isSliceCapableImageModel(model: ImageModelConfig): boolean {
+  return model.protocol === 'openai';
+}
+
+/** 可用于切图图片编辑的模型列表。 */
+export function getSliceCapableImageModels(registry: NovaModelRegistry): ImageModelConfig[] {
+  return getCompleteImageModels(registry).filter(isSliceCapableImageModel);
 }
 
 function getInitialRegistry(): NovaModelRegistry {
@@ -367,14 +418,14 @@ export function getTextModelById(registry: NovaModelRegistry, id: string): TextM
 
 export function getDefaultImageModel(
   registry: NovaModelRegistry,
-  task: keyof Pick<DefaultModels, 'textToImage' | 'imageToImage'>,
+  task: keyof Pick<DefaultModels, 'textToImage' | 'imageToImage' | 'sliceImageEdit'>,
 ): ImageModelConfig | undefined {
   return getImageModelById(registry, registry.defaults[task]);
 }
 
 export function getDefaultTextModel(
   registry: NovaModelRegistry,
-  task: keyof Pick<DefaultModels, 'reversePrompt' | 'agent' | 'promptOptimize' | 'imageDescribe'>,
+  task: TextDefaultTask,
 ): TextModelConfig | undefined {
   return getTextModelById(registry, registry.defaults[task]);
 }

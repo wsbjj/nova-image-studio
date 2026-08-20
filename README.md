@@ -6,7 +6,7 @@
 
 **dev 增强：Nacos 远程模型配置 · ZIP64 流式大备份 · Docker 开发预览 · 局域网 HTTPS**
 
-[![Version](https://img.shields.io/badge/version-v3.1.2-blue.svg)](https://github.com/wsbjj/nova-image-studio/tree/dev)
+[![Version](https://img.shields.io/badge/version-v3.2.0-blue.svg)](https://github.com/wsbjj/nova-image-studio/tree/dev)
 [![Branch](https://img.shields.io/badge/branch-dev-orange.svg)](https://github.com/wsbjj/nova-image-studio/tree/dev)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](https://nodejs.org)
@@ -21,7 +21,7 @@
 
 Nova Image Studio（简称 Nova Image）是一个面向个人/团队的 AI 图像生成工作台。前端使用 Next.js 16 + React 19 静态导出（PWA），后端是轻量 Node.js 服务（`server.js` + SQLite + WebSocket），统一调度任务并代理图像生成 API。
 
-本仓库的默认分支 `dev` 基于 [tianjiangqiji/nova-image-studio](https://github.com/tianjiangqiji/nova-image-studio) `v3.1.2` 持续增强，在保留原有生成工作台、Agent、无限画布和提示词广场的基础上，重点补齐团队模型配置、大数据备份、本机开发与局域网部署链路。
+本仓库的默认分支 `dev` 基于 [tianjiangqiji/nova-image-studio](https://github.com/tianjiangqiji/nova-image-studio) `v3.2.0` 持续增强，在保留原有生成工作台、Agent、无限画布和提示词广场的基础上，重点补齐团队模型配置、大数据备份、本机开发与局域网部署链路。
 
 **开源版特性：**
 - 支持分别配置图片模型与文本模型，模型级独立保存 API Key 与 Base URL
@@ -29,7 +29,7 @@ Nova Image Studio（简称 Nova Image）是一个面向个人/团队的 AI 图�
 - 所有配置存储在浏览器 localStorage
 - 文字模型支持 Google（generateContent）和 OpenAI（Response 协议）
 
-> 当前版本：**v3.1.2**
+> 当前版本：**v3.2.0**
 
 ## 🧭 dev 分支改动与优化
 
@@ -59,6 +59,18 @@ Nova Image Studio（简称 Nova Image）是一个面向个人/团队的 AI 图�
 |:---:|:---:|:---:|
 | ![生图工作台宽屏](doc/生图工作台宽屏.png) | ![生图工作台窄屏](doc/生图工作台窄屏.png) | ![生图工作台手机版](doc/生图工作台手机版.png) |
 
+### UI设计模式（图片切图 + 网页复刻）
+
+从一张 UI 原图出发：AI 自动拆图 → 切图编辑器手动调整 → agent 多轮对话复刻网页 → 导出完整设计包。
+
+| ① 待复刻原图 | ② 导入并开始拆图 | ③ 自动拆图 + 手动调整 | ④ 开始生成网页复刻 |
+|:---:|:---:|:---:|:---:|
+| ![待复刻原图](doc/待复刻原图.png) | ![导入并开始拆图](doc/导入并开始拆图.png) | ![完成自动拆图并手动调整](doc/完成自动拆图并手动调整或拆图.png) | ![开始生成网页复刻](doc/开始生成网页复刻.png) |
+
+| ⑤ Agent 修改复刻 | ⑥ 多轮完成修改 | ⑦ 导出为压缩包 | ⑧ 实物展示 |
+|:---:|:---:|:---:|:---:|
+| ![Agent修改复刻](doc/agent修改复刻.png) | ![多轮完成修改](doc/多轮完成修改.png) | ![导出为压缩包](doc/导出为压缩包.png) | ![实物展示](doc/实物展示.png) |
+
 ### Agent 模式
 
 | 询问 | 生成 |
@@ -87,15 +99,34 @@ Nova Image Studio（简称 Nova Image）是一个面向个人/团队的 AI 图�
 
 ## ✨ 功能特性
 
-### 五大工作模式
+### 六大工作模式
 
 | 模式 | 入口 | 简介 |
 | --- | --- | --- |
 | 🎨 文本生图 | `TextToImageForm` | 纯文字提示词生成图像，支持多图并行 |
 | 🖼️ 图生图 | `ImageToImageForm` | 上传参考图，编辑/转换/风格化 |
 | 🤖 Agent 智能体 | `AgentChatWorkspace` | 多轮对话式生成：聊天 → 方案 → 出图，支持 vision 描述、联网搜索、reasoning |
+| ✂️ UI设计模式 | `SliceWorkspace` | UI 图 → 切图资产 → 网页复刻（仅宽屏可用，详见下节） |
 | 🔍 反推提示词 | `ReversePromptForm` | 上传图片流式反推提示词（支持所有已配置的文字模型） |
 | 🎬 动图生成 | `GifGenerationWorkspace` | 多帧生图 + 网格拼合，浏览器端编码 GIF（`gifenc`） |
+
+### UI设计模式（图片切图 + 网页复刻）
+
+把一张平面 UI 图拆解成可复用的切图资产，并进一步复刻为可预览的网页。**仅宽屏模式可用**，窄屏显示切换提示。
+
+- **AI 拆图**：视觉模型识别切片与背景候选，结果先在确认弹窗里逐条勾选再落库；JSON 解析失败会自动发起一次无图修复重试
+- **切图编辑器**：画布缩放/平移、拖拽创建、框选多选、8 向缩放、四角圆角、吸附对齐、右键菜单、完整撤销重做（50 步）与快捷键
+- **三种查看模式**：原图（源图 + 轮廓）／挖洞（抠图后效果，本地生成不消耗额度）／仅切图（棋盘底）
+- **四种资产处理**：算法透明、AI 透明、算法 SVG 矢量化（`imagetracerjs`）、AI 重绘 SVG。四者各自独立可还原，互不覆盖；算法类支持批量，AI 类只能逐个触发（避免一次点击连续扣费）
+- **背景补齐**：在背景确认弹窗里调整蓝框（背景范围）与红框（移除区域），调用带蒙版的图片编辑补齐被前景遮挡的背景；产出「局部合成」与「AI 原图」两个结果供选择
+- **网页复刻**：多轮 AI agent 对话，产物是固定三文件（`index.html` / `styles.css` / `script.js`）+ 只读 `assets/`。agent 通过 `read_file` / `edit_file` 按行编辑，iframe 实时预览，上下文用量以 API 回报的 `input_tokens` 为准（140K 提醒 / 175K 拒绝）
+- **导出**：切图包 ZIP（PNG + 可选 SVG + manifest）或完整设计包（含源图、工作区元数据与 `web/` 网页文件），并支持从导出包还原工作区
+- **数据**：工作区与图片存于 IndexedDB（`nova-slice-db`），纳入一键备份/恢复范围
+
+> ⚠️ 「AI 补齐」（画笔蒙版局部重绘）暂未包含在本版本中。其请求管线与背景补齐共用且工作正常，
+> 待编辑器组件的一处渲染时序缺陷修复后再开放。
+
+> 图片编辑相关能力（AI 透明化、背景补齐）需要一个 **OpenAI 协议**的图片模型：它们依赖带 `mask` 的 `/v1/images/edits`，Gemini 与 Grok 协议没有该语义，因此不会出现在切图页的模型选择器里。
 
 ### 提示词广场
 
@@ -115,7 +146,8 @@ Nova Image 采用**用户自定义模型**架构：
 - **图像模型**：用户自由添加、编辑、删除，支持设置协议、显示名称、模型 ID、最大参考图数量、最大分辨率
 - **Image 2 额外参数**：仅 OpenAI 图片模型显示，透明背景、质量、风格控件默认开启，用户可手动关闭
 - **文字模型**：支持自定义扩展，兼容 Gemini 和 OpenAI Response
-- **默认模型**：可为文本生图、图生图、反推提示词、Agent 等任务分别设置默认模型
+- **默认模型**：可为文本生图、图生图、反推提示词、Agent、AI 拆图、网页复刻、切图图片编辑等任务分别设置默认模型
+- **多协议文本模型**：OpenAI Responses / OpenAI Chat Completions / Anthropic Messages / Google Gemini 四种协议，均支持多轮工具调用（UI设计模式的网页复刻 agent 依赖此能力），统一经 `/api/nova/proxy/text` 转发
 - **Nacos 配置拉取**：通过“设置 → 模型 → 远程下发”读取统一模型注册表，默认使用 `public` / `DEFAULT_GROUP` / `nova-image-studio-model-registry.json`
 
 Nacos 配置内容至少需要包含以下字段：
@@ -138,7 +170,7 @@ Nacos 配置内容至少需要包含以下字段：
 - 提交后入队，服务端并发处理（默认上限 50，可通过 `NOVA_TASK_CONCURRENCY` 调整）
 - 浏览器通过 **WebSocket** 实时接收任务/队列状态，断线自动重连，失败 5 次后回退 **HTTP 轮询**（30 秒间隔）
 - 任务结果本地落盘（默认 `backend/data/nova-images/`，可用 `NOVA_IMAGE_DIR` 调整），HTTP 路由 `/api/nova/images/:taskId/:index` 直接提供
-- 任务 TTL 12 小时，过期自动清理（5 分钟一次）
+- 任务 TTL 12 小时（可通过 `NOVA_TASK_TTL_HOURS` 调整），过期自动清理（5 分钟一次）
 - 服务重启时把残留"处理中"任务标记为失败并删除产物，避免幽灵任务
 
 ### 体验与工程化
@@ -164,9 +196,12 @@ nova-image-studio/
 │   │   ├── components/       # 业务组件 + shadcn/ui 基础组件
 │   │   │   ├── workspace/    # 主工作台壳、Tab、Header、结果区
 │   │   │   ├── agent/        # Agent 模式相关组件
+│   │   │   ├── slice/        # UI设计模式：切图编辑器、资产面板、网页复刻
 │   │   │   └── ui/           # shadcn 风格 UI 基础件
 │   │   ├── hooks/            # useQueueStatus / useAgentChat / useGifWorkflow / ...
 │   │   ├── lib/              # 客户端工具、API 客户端、WebSocket、ZIP64 备份、Nacos 配置
+│   │   │   ├── slice-*.ts    # 切图几何/裁剪/矢量化/导出/AI 客户端
+│   │   │   └── web-agent/    # 网页复刻 agent：虚拟文件系统、工具、主循环
 │   │   └── test/             # vitest 配置与用例
 │   ├── public/               # PWA 图标、静态资源
 │   ├── next.config.ts        # 静态导出 + next-pwa 配置
@@ -487,6 +522,7 @@ docker push <registry>/<namespace>/nova-image-studio:dev
 | `NOVA_TASK_DB` | 否 | `./nova-tasks.sqlite` | SQLite 文件路径（相对 `process.cwd()`）；建议 `./data/...` 或 Docker 下 `backend/data/...` |
 | `NOVA_IMAGE_DIR` | 否 | `./nova-images`（相对 `__dirname` 即 `backend/`） | 任务产物落盘目录；建议 `./data/nova-images` 或 Docker 下 `backend/data/nova-images` |
 | `NOVA_TASK_CONCURRENCY` | 否 | `50` | 最大并发任务数（绝对上限 50） |
+| `NOVA_TASK_TTL_HOURS` | 否 | `12` | 任务清理时间（小时），超过该时间后任务和图片将被删除 |
 | `NOVA_MAX_QUEUE_SIZE` | 否 | `200` | 全局最大待处理任务数 |
 | `NOVA_RATE_LIMIT_WINDOW_MS` | 否 | `60000` | 创建任务速率限制窗口，单位毫秒 |
 | `NOVA_RATE_LIMIT_MAX_REQUESTS_PER_IP` | 否 | `20` | 单 IP 在一个窗口内最多创建多少个任务 |
@@ -552,13 +588,17 @@ NOVA_ACCEPT_NEW_TASKS=false
 保存即生效。等待在飞任务完成后即可重启升级。再次开启设为 `true` 或留空。
 
 **任务多久会过期？**
-创建后 12 小时；前端在拿到结果后会调用 `/ack` 续期 2 分钟，给下载留时间。超过 TTL 服务端删除数据库记录与产物图片。
+默认创建后 12 小时（可通过 `NOVA_TASK_TTL_HOURS` 配置修改）；前端在拿到结果后会调用 `/ack` 续期 2 分钟，给下载留时间。超过 TTL 服务端删除数据库记录与产物图片。
 
 ---
 
 ## 🙏 致谢
 
 本项目的无限画布工作区功能基于 [infinite-canvas](https://github.com/basketikun/infinite-canvas) 项目开发，感谢原作者 [basketikun](https://github.com/basketikun) 的开源贡献。
+
+本项目的 UI设计模式（图片切图）功能参考 [image-to-slice](https://github.com/50kg/image-to-slice) 项目实现，感谢原作者 [50kg](https://github.com/50kg) 的开源贡献。原项目是 Figma 插件，本项目移植了其中与 Figma 无关的核心切图流程，并重写了 UI、模型配置与数据存储。
+
+切图的本地 SVG 矢量化基于 [imagetracerjs](https://github.com/jankovicsandras/imagetracerjs)。
 
 感谢 [Linux.do](https://linux.do/) 社区的支持。
 

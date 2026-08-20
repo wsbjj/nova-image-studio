@@ -131,6 +131,7 @@ export function AgentChatWorkspace({ wideMode = false, disabled = false, onConfi
   // 确认弹窗状态：删除单条 / 撤回以下所有
   const [deleteConfirmMsgId, setDeleteConfirmMsgId] = useState<string | null>(null);
   const [rollbackConfirmMsgId, setRollbackConfirmMsgId] = useState<string | null>(null);
+  const [retryConfirmMsgId, setRetryConfirmMsgId] = useState<string | null>(null);
 
   // 主动查询冷却：触发后短暂禁用按钮，避免重复查询
   const [onCooldown, setOnCooldown] = useState(false);
@@ -625,6 +626,11 @@ export function AgentChatWorkspace({ wideMode = false, disabled = false, onConfi
             }}
             onDelete={() => setDeleteConfirmMsgId(message.id)}
             onRollback={() => setRollbackConfirmMsgId(message.id)}
+            onRetry={
+              message.id === agent.retryableMessageId && agent.phase === 'idle'
+                ? () => setRetryConfirmMsgId(message.id)
+                : undefined
+            }
             onRedescribe={agent.redescribeImage}
           />
         ))}
@@ -1199,6 +1205,20 @@ export function AgentChatWorkspace({ wideMode = false, disabled = false, onConfi
             setDeleteConfirmMsgId(null);
           }}
           onCancel={() => setDeleteConfirmMsgId(null)}
+        />,
+        document.body
+      )}
+
+      {retryConfirmMsgId && createPortal(
+        <ConfirmDialog
+          title="重试这条消息"
+          message="将用这条消息重新向模型提问，并丢弃它之后的回复与提案。你发送的内容与其中的图片会保留。"
+          confirmText="重试"
+          onConfirm={() => {
+            agent.retryMessage(retryConfirmMsgId);
+            setRetryConfirmMsgId(null);
+          }}
+          onCancel={() => setRetryConfirmMsgId(null)}
         />,
         document.body
       )}

@@ -35,6 +35,8 @@ export interface AgentMessageBubbleProps {
   onCopy?: () => void;
   onDelete?: () => void;
   onRollback?: () => void;
+  /** 仅最后一条用户消息会拿到该回调；见 useAgentChat 的 retryableMessageId */
+  onRetry?: () => void;
   onRedescribe?: (imgId: string) => Promise<string>;
 }
 
@@ -65,6 +67,7 @@ export function AgentMessageBubble({
   onCopy,
   onDelete,
   onRollback,
+  onRetry,
   onRedescribe,
 }: AgentMessageBubbleProps) {
   const [previewImages, setPreviewImages] = useState<string[] | null>(null);
@@ -300,6 +303,17 @@ export function AgentMessageBubble({
             {copiedText ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
             {copiedText ? '已复制' : '复制'}
           </button>
+          {onRetry && (
+            <button
+              type="button"
+              onClick={onRetry}
+              className="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[10px] text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-colors"
+              title="用这条消息重新提问，丢弃它之后的回复"
+            >
+              <RefreshCw className="h-3 w-3" />
+              重试
+            </button>
+          )}
           {onRollback && (
             <button
               type="button"

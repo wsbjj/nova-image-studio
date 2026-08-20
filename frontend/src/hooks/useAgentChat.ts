@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { hasAnyApiKey } from '@/lib/settings-storage';
 import { generateUUID } from '@/lib/uuid';
 import { createNovaTask, getNovaTask, resolveImageTaskProvider, type ImageReference } from '@/lib/ccode-task-client';
@@ -1104,6 +1104,62 @@ export function useAgentChat() {
     if (phase !== 'idle') setPhase('idle');
   }, [messages, phase, cleanupOrphanImages, flushAndCancelRaf]);
 
+  /**
+   * 最后一条用户消息的 id；不存在或其后还有别的用户消息时为 null。
+   *
+   * 重试**只允许**作用于它，这是刻意的限制：重试中间某轮意味着要丢弃它之后
+   * 的全部对话，否则模型会看到「同一个问题两个不同答案」的历史而错乱。
+   * 与其偷偷替用户删掉后面几轮，不如只在最后一轮给出重试入口 ——
+   * 想改中间某轮，用现成的「撤回以下所有」把尾巴清掉再重试。
+   */
+  const retryableMessageId = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (message.role === 'user') return message.id;
+      // 分隔线之后没有用户消息 → 没有可重试的一轮
+      if (message.role === 'context-divider') return null;
+    }
+    return null;
+  }, [messages]);
+
+  /**
+   * 重试最后一条用户消息：删掉它之后的助手回复，用同一条用户消息重新发起请求。
+   *
+   * 用户消息本身**保留**（不重新登记图片、不重算描述），只回滚模型侧产物。
+   * 因此关联图片一律不清理 —— 它们仍被那条保留下来的用户消息引用。
+   */
+  const retryMessage = useCallback((messageId: string) => {
+    if (phase !== 'idle') return;
+    const index = messages.findIndex(m => m.id === messageId);
+    if (index === -1) return;
+    const target = messages[index];
+    if (target.role !== 'user' || messageId !== retryableMessageId) return;
+
+    // 丢弃这条用户消息之后的所有内容（助手回复、系统提示、提案分析）
+    const toRemove = messages.slice(index + 1);
+    const kept = messages.slice(0, index + 1);
+    if (toRemove.length > 0) {
+      setMessages(kept);
+      void deleteMessages(toRemove.map(m => m.id));
+      // 只清理「被删除消息引用、且保留部分不再引用」的图片。
+      // 用户消息还在，它引用的上传图不会被误删。
+      cleanupOrphanImages(kept, toRemove.flatMap(m => m.imageIds || []));
+    }
+
+    pendingAnalysisRef.current = '';
+    pendingReasoningRef.current = '';
+    isReeditRef.current = false;
+    setProposal(null);
+    void clearPendingProposal();
+    flushAndCancelRaf();
+    setStreamingText('');
+    setStreamingReasoning('');
+    setError(null);
+
+    const { history, catalog } = sliceActiveContext(kept, images);
+    runChat(history, catalog);
+  }, [phase, messages, retryableMessageId, images, cleanupOrphanImages, flushAndCancelRaf, runChat]);
+
   // 组件卸载时清理：取消 rAF + 停止轮询/流式/描述，避免卸载后仍每 4s 轮询、
   // 在卸载后继续下载/写库/setState（内存泄漏 + 卸载后写状态）。
   useEffect(() => {
@@ -1145,6 +1201,8 @@ export function useAgentChat() {
     withdrawTurn,
     deleteMessage,
     rollbackMessages,
+    retryMessage,
+    retryableMessageId,
     checkNow,
     stopStreaming,
     skipDescribing,

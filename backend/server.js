@@ -105,7 +105,7 @@ function hashPromptGalleryPassword(password) {
 const PORT = Number(process.env.PORT || 3000);
 const HOSTNAME = process.env.HOSTNAME || '0.0.0.0';
 const DB_PATH = process.env.NOVA_TASK_DB || path.join(__dirname, 'nova-tasks.sqlite');
-const TASK_TTL_MS = 12 * 60 * 60 * 1000;
+const TASK_TTL_MS = (Number(process.env.NOVA_TASK_TTL_HOURS) || 12) * 60 * 60 * 1000;
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 const IMAGE_STREAM_ENABLED = String(process.env.NOVA_IMAGE_STREAM ?? 'true').toLowerCase() !== 'false';
@@ -598,6 +598,42 @@ function readJsonBody(req) {
       } catch {
         reject(new Error('请求 JSON 格式无效'));
       }
+    });
+    req.on('error', reject);
+  });
+}
+
+/** 图片编辑代理的请求体上限。image + mask 两张 PNG，按 4096² 上限留出余量。 */
+const MAX_IMAGE_EDIT_BODY_BYTES = 64 * 1024 * 1024; // 64MB
+
+/**
+ * 读取原始请求体为 Buffer，不做任何解析。
+ * 供 multipart 透传使用：解析再重组 multipart 既费内存也容易破坏 boundary。
+ */
+function readRawBody(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    let aborted = false;
+    req.on('data', chunk => {
+      if (aborted) return;
+      size += chunk.length;
+      if (size > maxBytes) {
+        aborted = true;
+        chunks.length = 0;
+        req.resume(); // 排空剩余入站数据，避免客户端收到连接重置
+        reject(createHttpError(
+          413,
+          'PAYLOAD_TOO_LARGE',
+          `图片数据过大（超过 ${Math.round(maxBytes / 1024 / 1024)}MB），请缩小源图后重试。`,
+        ));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (aborted) return;
+      resolve(Buffer.concat(chunks));
     });
     req.on('error', reject);
   });
@@ -2043,6 +2079,63 @@ async function handleApi(req, res, pathname) {
         });
       } catch {
         sendJson(res, 404, { error: 'Not Found' });
+      }
+      return true;
+    }
+
+    // ===== 图片编辑代理（切图的 AI 透明化 / 背景补齐） =====
+    //
+    // 与 /api/nova/proxy/text 的差别：这里转发的是 multipart/form-data（含 image 与可选 mask
+    // 的二进制），所以**不解析请求体**，原样透传字节流，只替换鉴权头。
+    // 凭据走自定义头而不是表单字段，正是为了不必解析 multipart。
+    //
+    // 仅支持 openai 协议：/v1/images/edits 的 mask 语义只有它有，
+    // 前端已在模型选择器层过滤（见 isSliceCapableImageModel），这里再兜一次。
+    if (req.method === 'POST' && apiPathname === '/api/nova/proxy/image-edit') {
+      try {
+        const baseUrl = req.headers['x-nova-base-url'];
+        const apiKey = req.headers['x-nova-api-key'];
+        if (!baseUrl || !apiKey) {
+          sendJson(res, 400, { error: 'Missing x-nova-base-url or x-nova-api-key' });
+          return true;
+        }
+
+        const contentType = String(req.headers['content-type'] || '');
+        if (!contentType.toLowerCase().includes('multipart/form-data')) {
+          sendJson(res, 400, { error: '图片编辑代理只接受 multipart/form-data' });
+          return true;
+        }
+
+        const rawBody = await readRawBody(req, MAX_IMAGE_EDIT_BODY_BYTES);
+        const normalizedBaseUrl = normalizeProtocolBaseUrl('openai', String(baseUrl));
+
+        const upstream = await fetchWithTimeout(`${normalizedBaseUrl}/v1/images/edits`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': contentType,
+            'Authorization': `Bearer ${apiKey}`,
+          },
+          body: rawBody,
+        });
+
+        // 响应可能是 JSON（b64_json / url）也可能是图片字节，一律按原样回传，
+        // 由前端的 readImageResponse 统一判别。
+        const upstreamType = upstream.headers.get('content-type') || 'application/json';
+        const buffer = Buffer.from(await upstream.arrayBuffer());
+        res.writeHead(upstream.status, {
+          'Content-Type': upstreamType,
+          'Content-Length': buffer.length,
+          'Cache-Control': 'no-store',
+        });
+        res.end(buffer);
+      } catch (error) {
+        if (error && error.statusCode === 413) {
+          sendJson(res, 413, { error: error.message });
+        } else if (error && error.message && /abort|timeout/i.test(error.message)) {
+          sendJson(res, 504, { error: '图片编辑请求上游超时' });
+        } else {
+          sendJson(res, 502, { error: normalizeError(error) });
+        }
       }
       return true;
     }

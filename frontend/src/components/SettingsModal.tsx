@@ -40,6 +40,7 @@ import {
   generateModelId,
   getDefaultTextModelTemplate,
   getImageModelOutputSizes,
+  isSliceCapableImageModel,
   loadRegistry,
   saveRegistry,
   type DefaultModels,
@@ -131,6 +132,7 @@ function normalizeDefaults(
 ): DefaultModels {
   const completeImageModels = imageModels.filter(isCompleteImageModel);
   const completeTextModels = textModels.filter(isCompleteTextModel);
+  const sliceCapableImageModels = completeImageModels.filter(isSliceCapableImageModel);
   const firstImageModelId = completeImageModels[0]?.id || '';
   const firstTextModelId = completeTextModels[0]?.id || '';
 
@@ -141,6 +143,12 @@ function normalizeDefaults(
     agent: completeTextModels.some((model) => model.id === defaults.agent) ? defaults.agent : firstTextModelId,
     promptOptimize: completeTextModels.some((model) => model.id === defaults.promptOptimize) ? defaults.promptOptimize : firstTextModelId,
     imageDescribe: completeTextModels.some((model) => model.id === defaults.imageDescribe) ? defaults.imageDescribe : firstTextModelId,
+    sliceDecomposition: completeTextModels.some((model) => model.id === defaults.sliceDecomposition) ? defaults.sliceDecomposition : firstTextModelId,
+    sliceReconstruct: completeTextModels.some((model) => model.id === defaults.sliceReconstruct) ? defaults.sliceReconstruct : firstTextModelId,
+    // 切图的图片编辑只能落在 openai 协议模型上；没有这类模型时留空并在切图页提示
+    sliceImageEdit: sliceCapableImageModels.some((model) => model.id === defaults.sliceImageEdit)
+      ? defaults.sliceImageEdit
+      : (sliceCapableImageModels[0]?.id || ''),
   };
 }
 
@@ -287,6 +295,8 @@ export function SettingsModal({ isOpen, onClose, onApiKeyChange }: SettingsModal
       agent: prev.agent === id ? '' : prev.agent,
       promptOptimize: prev.promptOptimize === id ? '' : prev.promptOptimize,
       imageDescribe: prev.imageDescribe === id ? '' : prev.imageDescribe,
+      sliceDecomposition: prev.sliceDecomposition === id ? '' : prev.sliceDecomposition,
+      sliceReconstruct: prev.sliceReconstruct === id ? '' : prev.sliceReconstruct,
     }));
     if (selectedTextModelId === id) {
       setSelectedTextModelId(nextModels[0]?.id || '');
@@ -435,6 +445,10 @@ export function SettingsModal({ isOpen, onClose, onApiKeyChange }: SettingsModal
 
   const completeImageOptions = imageModels.filter(isCompleteImageModel).map((model) => ({ value: model.id, label: model.name }));
   const completeTextOptions = textModels.filter(isCompleteTextModel).map((model) => ({ value: model.id, label: model.name }));
+  // 切图的图片编辑只能落在 openai 协议模型上（带 mask 的 /v1/images/edits）
+  const sliceCapableImageOptions = imageModels
+    .filter((model) => isCompleteImageModel(model) && isSliceCapableImageModel(model))
+    .map((model) => ({ value: model.id, label: model.name }));
   const selectedImageOutputSizes = selectedImageModel
     ? getImageModelOutputSizes({
         ...selectedImageModel,
@@ -747,6 +761,25 @@ export function SettingsModal({ isOpen, onClose, onApiKeyChange }: SettingsModal
                   <label className="text-xs text-muted-foreground">图片描述默认模型</label>
                   <Select value={defaults.imageDescribe} onValueChange={(value) => setDefaults((prev) => ({ ...prev, imageDescribe: value }))} options={completeTextOptions} />
                 </div>
+                <div className="space-y-2">
+                  <label className="text-xs text-muted-foreground">AI 拆图默认模型</label>
+                  <Select value={defaults.sliceDecomposition} onValueChange={(value) => setDefaults((prev) => ({ ...prev, sliceDecomposition: value }))} options={completeTextOptions} />
+                  <p className="text-[11px] text-muted-foreground">UI设计模式：识别切片与背景候选，需要视觉能力</p>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-xs text-muted-foreground">网页复刻默认模型</label>
+                  <Select value={defaults.sliceReconstruct} onValueChange={(value) => setDefaults((prev) => ({ ...prev, sliceReconstruct: value }))} options={completeTextOptions} />
+                  <p className="text-[11px] text-muted-foreground">UI设计模式：多轮工具调用生成网页，建议用能力更强的模型</p>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-xs text-muted-foreground">切图图片编辑默认模型</label>
+                  <Select value={defaults.sliceImageEdit} onValueChange={(value) => setDefaults((prev) => ({ ...prev, sliceImageEdit: value }))} options={sliceCapableImageOptions} />
+                  <p className="text-[11px] text-muted-foreground">
+                    {sliceCapableImageOptions.length === 0
+                      ? '需要一个 OpenAI 协议的图片模型；Gemini / Grok 不支持带蒙版的局部编辑'
+                      : 'AI 透明化与背景补齐使用，仅支持 OpenAI 协议'}
+                  </p>
+                </div>
               </div>
 
               {modelCheckError && <div className="rounded-lg border border-destructive/20 bg-destructive/10 p-3 text-sm text-destructive">{modelCheckError}</div>}
@@ -890,6 +923,7 @@ export function SettingsModal({ isOpen, onClose, onApiKeyChange }: SettingsModal
                   <li>本站为本地优先应用：模型配置、任务历史、设置与生成图片默认保存在你的浏览器本地。</li>
                   <li>每个模型的 API Key 和 Base URL 仅用于调用你自己配置的上游服务。</li>
                   <li>生图、反推、Agent、提示词优化等功能会把你当前选择的提示词、参考图或对话内容发送到对应模型配置的上游接口。</li>
+                  <li>UI设计模式会把源图截图、切图资产总览图与对话内容发送到你配置的文本/图片模型；切图工作区与图片数据只存在本地 IndexedDB。</li>
                   <li>备份文件可能包含模型配置、本地任务记录与图片数据，请自行妥善保管。</li>
                 </ul>
               </details>
@@ -921,6 +955,23 @@ export function SettingsModal({ isOpen, onClose, onApiKeyChange }: SettingsModal
                     {' '}
                     <a href="https://github.com/basketikun/infinite-canvas" target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-primary hover:underline">
                       basketikun/infinite-canvas <ExternalLink className="w-3 h-3" />
+                    </a>
+                    。
+                  </li>
+                  <li>
+                    UI设计模式（图片切图）参考
+                    {' '}
+                    <a href="https://github.com/50kg/image-to-slice" target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-primary hover:underline">
+                      50kg/image-to-slice <ExternalLink className="w-3 h-3" />
+                    </a>
+                    {' '}
+                    实现。原项目是 Figma 插件，本项目移植了其中与 Figma 无关的核心切图流程。
+                  </li>
+                  <li>
+                    切图的本地 SVG 矢量化基于
+                    {' '}
+                    <a href="https://github.com/jankovicsandras/imagetracerjs" target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-primary hover:underline">
+                      jankovicsandras/imagetracerjs <ExternalLink className="w-3 h-3" />
                     </a>
                     。
                   </li>

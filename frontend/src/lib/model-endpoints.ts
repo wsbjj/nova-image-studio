@@ -5,6 +5,7 @@ import {
   getTextModelById,
   loadRegistry,
   type ProviderProtocol,
+  type TextDefaultTask,
   type TextModelConfig,
 } from '@/lib/nova-models';
 import type { TextProviderProtocol } from '@/lib/nova-text-protocol';
@@ -50,16 +51,12 @@ export function getConfiguredTextModel(modelId: string): TextModelConfig | undef
   return getTextModelById(registry, modelId);
 }
 
-export function getDefaultConfiguredTextModel(
-  task: 'reversePrompt' | 'agent' | 'promptOptimize' | 'imageDescribe',
-): TextModelConfig | undefined {
+export function getDefaultConfiguredTextModel(task: TextDefaultTask): TextModelConfig | undefined {
   const registry = loadRegistry();
   return getDefaultTextModel(registry, task);
 }
 
-export function requireDefaultConfiguredTextModel(
-  task: 'reversePrompt' | 'agent' | 'promptOptimize' | 'imageDescribe',
-): TextModelConfig {
+export function requireDefaultConfiguredTextModel(task: TextDefaultTask): TextModelConfig {
   const configured = getDefaultConfiguredTextModel(task);
   if (!configured?.apiKey || !configured.baseUrl || !configured.modelId) {
     throw new Error('请先在设置中完成默认文本模型配置');

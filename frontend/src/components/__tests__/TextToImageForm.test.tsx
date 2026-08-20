@@ -49,6 +49,9 @@ describe('TextToImageForm', () => {
         agent: '',
         promptOptimize: '',
         imageDescribe: '',
+        sliceDecomposition: '',
+        sliceReconstruct: '',
+        sliceImageEdit: '',
       },
     })
     syncDynamicModelExports()

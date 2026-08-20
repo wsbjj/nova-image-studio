@@ -50,6 +50,8 @@ const LOCAL_STORAGE_KEYS = [
     'nova-assets-settings',
     // 无限画布生成配置
     'nova-image:canvas_config',
+    // UI设计模式（图片切图）的图片模型选择
+    'nova-slice-settings',
 ];
 
 // IndexedDB databases to backup
@@ -61,6 +63,8 @@ const INDEXEDDB_DATABASES = [
     { name: 'nova-agent-db', version: 1, stores: ['messages', 'images', 'meta'] },
     // 本地图片素材库
     { name: 'nova-assets-db', version: 1, stores: ['assets', 'asset-blobs'] },
+    // UI设计模式：切图工作区 + 切图/源图 blob
+    { name: 'nova-slice-db', version: 1, stores: ['workspaces', 'blobs'] },
 ];
 
 // localforage keyless 实例（无限画布：项目状态 + 图片 blob）。
@@ -340,6 +344,14 @@ function openDatabase(name: string, version: number, createStores: boolean = fal
                 }
                 if (!db.objectStoreNames.contains('asset-blobs')) {
                     db.createObjectStore('asset-blobs', { keyPath: 'key' });
+                }
+            } else if (name === 'nova-slice-db') {
+                // 与 slice-db.ts 的 onupgradeneeded 保持一致
+                if (!db.objectStoreNames.contains('workspaces')) {
+                    db.createObjectStore('workspaces', { keyPath: 'id' });
+                }
+                if (!db.objectStoreNames.contains('blobs')) {
+                    db.createObjectStore('blobs', { keyPath: 'key' });
                 }
             }
         };
