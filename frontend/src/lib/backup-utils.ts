@@ -70,6 +70,11 @@ const LOCALFORAGE_STORES: { name: string; storeName: string }[] = [
     { name: 'nova-image', storeName: 'canvas_image_files' },
 ];
 
+const CANVAS_DB_NAME = 'nova-image';
+const CANVAS_STATE_STORE = 'canvas_app_state';
+const CANVAS_IMAGE_STORE = 'canvas_image_files';
+const CANVAS_STATE_KEY = 'nova-image:canvas_store';
+
 type LocalForageEntry = { key: string; value: unknown } | { key: string; _blobRef: string; _blobMimeType: string };
 type LocalForageBackup = Record<string, Record<string, LocalForageEntry[]>>;
 
@@ -89,6 +94,130 @@ function yieldToMain(): Promise<void> {
     });
 }
 
+function isBlobValue(value: unknown): value is Blob {
+    if (!value || typeof value !== 'object') return false;
+    if (typeof Blob !== 'undefined' && value instanceof Blob) return true;
+    // localforage may return a Blob from another realm (for example, after a
+    // browser restores an IndexedDB value).  `instanceof` is false across
+    // realms, while the brand check remains stable.
+    return Object.prototype.toString.call(value) === '[object Blob]';
+}
+
+function describeError(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
+function collectStorageKeys(value: unknown): Set<string> {
+    const keys = new Set<string>();
+    const pending: unknown[] = [value];
+
+    while (pending.length) {
+        const current = pending.pop();
+        if (!current || typeof current !== 'object') continue;
+        if ('storageKey' in current && typeof current.storageKey === 'string' && current.storageKey.startsWith('image:')) {
+            keys.add(current.storageKey);
+        }
+        for (const child of Object.values(current)) {
+            if (child && typeof child === 'object') pending.push(child);
+        }
+    }
+
+    return keys;
+}
+
+function getRequiredCanvasImageKeys(data: LocalForageBackup): Set<string> {
+    const entries = data[CANVAS_DB_NAME]?.[CANVAS_STATE_STORE];
+    if (!Array.isArray(entries)) return new Set();
+    const stateEntry = entries.find((entry) => entry.key === CANVAS_STATE_KEY && 'value' in entry);
+    if (!stateEntry || !('value' in stateEntry)) return new Set();
+
+    try {
+        const state = typeof stateEntry.value === 'string' ? JSON.parse(stateEntry.value) : stateEntry.value;
+        return collectStorageKeys(state);
+    } catch (error) {
+        throw new Error(`无限画布状态无法解析：${describeError(error)}`);
+    }
+}
+
+function validateCanvasImageEntries(data: LocalForageBackup, archive?: BackupArchiveReader): void {
+    const requiredKeys = getRequiredCanvasImageKeys(data);
+    if (!requiredKeys.size) return;
+
+    const entries = data[CANVAS_DB_NAME]?.[CANVAS_IMAGE_STORE];
+    if (!Array.isArray(entries)) {
+        throw new Error(`备份不完整：无限画布引用了 ${requiredKeys.size} 张图片，但备份中没有图片索引`);
+    }
+
+    const entryByKey = new Map(entries.map((entry) => [entry.key, entry]));
+    const archivePaths = archive ? new Set(archive.list('blobs/')) : null;
+    const missingKeys: string[] = [];
+
+    for (const key of requiredKeys) {
+        const entry = entryByKey.get(key);
+        if (!entry || !('_blobRef' in entry) || typeof entry._blobRef !== 'string') {
+            missingKeys.push(key);
+            continue;
+        }
+        if (archivePaths && !archivePaths.has(`blobs/${entry._blobRef}`)) missingKeys.push(key);
+    }
+
+    if (missingKeys.length) {
+        throw new Error(`备份不完整：无限画布缺少 ${missingKeys.length}/${requiredKeys.size} 张节点图片`);
+    }
+}
+
+async function exportLocalForageStore(
+    cfg: { name: string; storeName: string },
+    writer: StreamingZipWriter,
+    selectedKeys?: Set<string>,
+    onProgress?: ProgressCallback,
+): Promise<LocalForageEntry[]> {
+    const instance = localforage.createInstance({ name: cfg.name, storeName: cfg.storeName });
+    const availableKeys = await instance.keys();
+    const availableKeySet = new Set(availableKeys);
+    const keys = selectedKeys ? Array.from(selectedKeys).sort() : availableKeys;
+    const entries: LocalForageEntry[] = [];
+
+    if (selectedKeys) {
+        const missingKeys = keys.filter((key) => !availableKeySet.has(key));
+        if (missingKeys.length) {
+            throw new Error(`本地图片库缺少 ${missingKeys.length}/${keys.length} 张节点图片`);
+        }
+    }
+
+    // Read one key at a time.  Iterating the whole store into an array first
+    // keeps every large Blob alive and can exhaust the renderer before the ZIP
+    // writer gets a chance to release it.
+    for (let index = 0; index < keys.length; index++) {
+        const key = keys[index];
+        let value: unknown;
+        try {
+            value = await instance.getItem<unknown>(key);
+        } catch (error) {
+            throw new Error(`无法读取图片 ${key}：${describeError(error)}`);
+        }
+        if (isBlobValue(value)) {
+            const ref = nextBlobRef();
+            await writer.addBlob(`blobs/${ref}`, value);
+            entries.push({ key, _blobRef: ref, _blobMimeType: value.type });
+        } else if (selectedKeys) {
+            throw new Error(`节点图片 ${key} 不是有效的 Blob`);
+        } else {
+            entries.push({ key, value });
+        }
+
+        if (index % 4 === 0 || index === keys.length - 1) {
+            onProgress?.({
+                percent: 92,
+                message: `正在导出无限画布图片 ${cfg.storeName} (${index + 1}/${keys.length})...`,
+            });
+            await yieldToMain();
+        }
+    }
+
+    return entries;
+}
+
 /**
  * 导出 localforage（keyless）store：保留 key；Blob 值以二进制存入 ZIP blobs/，JSON 内留引用。
  * 数据逐 store 写入 files 对象，释放引用后可被 GC 回收。
@@ -97,35 +226,17 @@ async function exportLocalForage(writer: StreamingZipWriter, onProgress?: Progre
     const result: LocalForageBackup = {};
     for (const cfg of LOCALFORAGE_STORES) {
         try {
-            const instance = localforage.createInstance({ name: cfg.name, storeName: cfg.storeName });
-            const entries: LocalForageEntry[] = [];
-            const pendingBlobs: { ref: string; blob: Blob }[] = [];
-            await instance.iterate((value: unknown, key: string) => {
-                if (value instanceof Blob) {
-                    const ref = nextBlobRef();
-                    pendingBlobs.push({ ref, blob: value });
-                    entries.push({ key, _blobRef: ref, _blobMimeType: value.type });
-                } else {
-                    entries.push({ key, value });
-                }
-            });
-            for (let index = 0; index < pendingBlobs.length; index++) {
-                const item = pendingBlobs[index];
-                await writer.addBlob(`blobs/${item.ref}`, item.blob);
-                if (index % 10 === 0) {
-                    onProgress?.({
-                        percent: 92,
-                        message: `正在导出无限画布图片 ${cfg.storeName} (${index + 1}/${pendingBlobs.length})...`,
-                    });
-                    await yieldToMain();
-                }
-            }
+            const selectedKeys = cfg.name === CANVAS_DB_NAME && cfg.storeName === CANVAS_IMAGE_STORE
+                ? getRequiredCanvasImageKeys(result)
+                : undefined;
+            const entries = await exportLocalForageStore(cfg, writer, selectedKeys, onProgress);
             if (!result[cfg.name]) result[cfg.name] = {};
             result[cfg.name][cfg.storeName] = entries;
-        } catch {
-            // skip failed localforage export
+        } catch (error) {
+            throw new Error(`导出 ${cfg.name}/${cfg.storeName} 失败：${describeError(error)}`);
         }
     }
+    validateCanvasImageEntries(result);
     return result;
 }
 
@@ -143,15 +254,15 @@ async function importLocalForage(data: LocalForageBackup, archive: BackupArchive
                 let value: unknown;
                 if ('_blobRef' in entry && typeof entry._blobRef === 'string') {
                     const blob = await archive.readBlob(`blobs/${entry._blobRef}`, entry._blobMimeType);
-                    if (!blob) continue;
+                    if (!blob) throw new Error(`缺少图片条目 blobs/${entry._blobRef}`);
                     value = blob;
                 } else {
                     value = (entry as { value: unknown }).value;
                 }
                 await instance.setItem(entry.key, value);
             }
-        } catch {
-            // skip failed localforage import
+        } catch (error) {
+            throw new Error(`导入 ${cfg.name}/${cfg.storeName} 失败：${describeError(error)}`);
         }
     }
 }
@@ -614,6 +725,16 @@ export async function importAllData(file: File, onProgress?: ProgressCallback): 
         }
     }
 
+    // 在覆盖任何现有数据之前校验画布图片索引。旧实现可能在图片
+    // store 导出失败后仍生成 ZIP，表现为“导入成功”但所有节点图片为空。
+    const localForageData: LocalForageBackup = {};
+    for (const path of archive.list('localforage/', '.json')) {
+        const dbName = path.replace('localforage/', '').replace('.json', '');
+        const text = await archive.readText(path);
+        if (text) localForageData[dbName] = JSON.parse(text);
+    }
+    validateCanvasImageEntries(localForageData, archive);
+
     // 读取 localStorage 数据
     if (onProgress) {
         onProgress({ percent: 10, message: '正在清空 localStorage...' });
@@ -652,12 +773,6 @@ export async function importAllData(file: File, onProgress?: ProgressCallback): 
     // 读取并导入 localforage（无限画布）数据
     if (onProgress) {
         onProgress({ percent: 92, message: '正在导入无限画布数据...' });
-    }
-    const localForageData: LocalForageBackup = {};
-    for (const path of archive.list('localforage/', '.json')) {
-        const dbName = path.replace('localforage/', '').replace('.json', '');
-        const text = await archive.readText(path);
-        if (text) localForageData[dbName] = JSON.parse(text);
     }
     await importLocalForage(localForageData, archive);
 

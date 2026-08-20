@@ -32,6 +32,7 @@ import { Input } from '@/components/ui/input';
 import { Select } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import { BackupProgress } from '@/components/BackupProgress';
+import { flushPendingCanvasSave } from '@/components/canvas/stores/use-canvas-store';
 import {
   BUILTIN_IMAGE_PRESETS,
   BUILTIN_IMAGE_PRESET_OPTIONS,
@@ -391,6 +392,7 @@ export function SettingsModal({ isOpen, onClose, onApiKeyChange }: SettingsModal
     setBackupError(null);
     setBackupSuccess(null);
     try {
+      await flushPendingCanvasSave();
       const blob = await exportAllData((progress) => setBackupProgress(progress));
       const filename = generateBackupFilename();
       downloadBlob(blob, filename);
@@ -412,6 +414,7 @@ export function SettingsModal({ isOpen, onClose, onApiKeyChange }: SettingsModal
     setBackupError(null);
     setBackupSuccess(null);
     try {
+      await flushPendingCanvasSave();
       await importAllData(file, (progress) => setBackupProgress(progress));
       setBackupSuccess('数据已成功导入，页面将在 2 秒后刷新。');
       setTimeout(() => window.location.reload(), 2000);
