@@ -131,6 +131,7 @@ export function CanvasMentionEditor({ value, references, onChange, onSubmit, pla
   const editorRef = useRef<HTMLDivElement>(null);
   const lastValueRef = useRef<string>("__canvas_init__");
   const labelByNodeIdRef = useRef<Map<string, string>>(new Map());
+  const mentionQueryRef = useRef<string | null>(null);
   const [mention, setMention] = useState<MentionState | null>(null);
   const [activeIndex, setActiveIndex] = useState(0);
 
@@ -170,6 +171,7 @@ export function CanvasMentionEditor({ value, references, onChange, onSubmit, pla
   }, [labelByNodeId]);
 
   const closeMention = useCallback(() => {
+    mentionQueryRef.current = null;
     setMention(null);
     setActiveIndex(0);
   }, []);
@@ -207,8 +209,12 @@ export function CanvasMentionEditor({ value, references, onChange, onSubmit, pla
     const range = selection.getRangeAt(0).cloneRange();
     let rect = range.getBoundingClientRect();
     if (!rect || (rect.x === 0 && rect.y === 0 && rect.width === 0 && rect.height === 0)) rect = el.getBoundingClientRect();
-    setMention({ query: match[2], rect });
-    setActiveIndex(0);
+    const query = match[2];
+    if (mentionQueryRef.current !== query) {
+      mentionQueryRef.current = query;
+      setActiveIndex(0);
+    }
+    setMention({ query, rect });
   }, [activeReferences.length, closeMention]);
 
   const insertReference = useCallback(
