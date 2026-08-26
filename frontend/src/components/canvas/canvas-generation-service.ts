@@ -6,6 +6,7 @@
  * 视频/音频不在范围内；图生图无 mask（队列不支持）。
  */
 import { ackNovaTask, createNovaTask, getNovaTask, resolveImageTaskProvider, type NovaTaskResponse, type NovaTaskStatus, type ImageReference } from "@/lib/ccode-task-client";
+import { fetchImageAsBlob } from "@/lib/image-downloader";
 import { normalizeModel } from "@/lib/model-capabilities";
 import { compressReferenceDataUrl } from "./lib/image-utils";
 import { uploadImage } from "./lib/image-storage";
@@ -15,12 +16,15 @@ import type { ReferenceImage } from "./types-media";
 export type { CanvasGenerationConfig };
 
 export type CanvasGeneratedImage = {
-  storageKey: string;
+  storageKey?: string;
   url: string;
   width: number;
   height: number;
   mimeType: string;
   bytes: number;
+  cacheStatus: "cached" | "pending";
+  remoteUrl?: string;
+  cacheError?: string;
 };
 
 export class CanvasApiKeyMissingError extends Error {
@@ -93,9 +97,8 @@ export async function pollNodeTask(
       if (task.status !== "completed" || images.length === 0) {
         throw new Error(task.error || (task.status === "expired" ? "该任务已超出取回时间" : "生成失败"));
       }
-      const stored = (await Promise.all(images.map(storeResultImage))).filter((item): item is CanvasGeneratedImage => Boolean(item));
-      void ackNovaTask(taskId);
-      if (stored.length === 0) throw new Error("生成结果保存失败");
+      const stored = await Promise.all(images.map((image) => storeResultImage(image)));
+      if (stored.every((item) => item.cacheStatus === "cached")) void ackNovaTask(taskId);
       return stored;
     }
     if (Date.now() > deadline) throw new Error("生成超时，请稍后重试");
@@ -104,11 +107,11 @@ export async function pollNodeTask(
 }
 
 /** 检查已有任务的当前状态（用于刷新页面后恢复进行中的任务）。 */
-export async function checkExistingTask(taskId: string): Promise<{ status: NovaTaskResponse["status"]; images?: CanvasGeneratedImage[]; error?: string }> {
+export async function checkExistingTask(taskId: string, maxDownloadRetries = 3): Promise<{ status: NovaTaskResponse["status"]; images?: CanvasGeneratedImage[]; error?: string }> {
   const task = await getNovaTask(taskId);
   if (task.status === "completed" && task.result?.images?.length) {
-    const stored = (await Promise.all(task.result.images.map(storeResultImage))).filter((item): item is CanvasGeneratedImage => Boolean(item));
-    void ackNovaTask(taskId);
+    const stored = await Promise.all(task.result.images.map((image) => storeResultImage(image, maxDownloadRetries)));
+    if (stored.every((item) => item.cacheStatus === "cached")) void ackNovaTask(taskId);
     return { status: "completed", images: stored };
   }
   if (task.status === "failed" || task.status === "expired") {
@@ -156,14 +159,32 @@ export async function generateCanvasImages(args: {
 }
 
 /** 结果可能是 data URL 或 `URL:/api/nova/images/...`；统一下载为 blob 存入本地 IndexedDB。 */
-async function storeResultImage(image: string): Promise<CanvasGeneratedImage | null> {
+async function storeResultImage(image: string, maxDownloadRetries = 3): Promise<CanvasGeneratedImage> {
   const realUrl = image.startsWith("URL:") ? image.slice(4) : image;
-  if (!realUrl) return null;
+  if (!realUrl) throw new Error("生成结果地址为空");
   try {
-    const stored = await uploadImage(realUrl);
-    return { storageKey: stored.storageKey, url: stored.url, width: stored.width, height: stored.height, mimeType: stored.mimeType, bytes: stored.bytes };
-  } catch {
-    return null;
+    const blob = await fetchImageAsBlob(realUrl, maxDownloadRetries);
+    const stored = await uploadImage(blob);
+    return {
+      storageKey: stored.storageKey,
+      url: stored.url,
+      width: stored.width,
+      height: stored.height,
+      mimeType: stored.mimeType,
+      bytes: stored.bytes,
+      cacheStatus: "cached",
+    };
+  } catch (error) {
+    return {
+      url: realUrl,
+      remoteUrl: realUrl,
+      width: 1024,
+      height: 1024,
+      mimeType: "image/png",
+      bytes: 0,
+      cacheStatus: "pending",
+      cacheError: error instanceof Error ? error.message : String(error),
+    };
   }
 }
 

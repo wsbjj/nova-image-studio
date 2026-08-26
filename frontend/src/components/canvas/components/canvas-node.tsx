@@ -249,6 +249,7 @@ function ImageNodeBody({
   onRefreshProgress?: (node: CanvasNodeData) => void | Promise<void>;
   onOpenImage?: (node: CanvasNodeData) => void;
 }) {
+  const [refreshingCache, setRefreshingCache] = useState(false);
   const fallbackContent = data.metadata?.content;
   // 不渲染刷新后失效的 blob: URL（避免 ERR_FILE_NOT_FOUND）；由上层 imageUrl（storageKey 解析）提供有效地址
   const url = imageUrl || (fallbackContent && !fallbackContent.startsWith("blob:") ? fallbackContent : undefined);
@@ -304,6 +305,24 @@ function ImageNodeBody({
         >
           <Save className="size-3.5" />
           存素材
+        </button>
+      )}
+
+      {url && !isGenerating && data.metadata?.generationTaskId && (data.metadata?.resultCacheStatus === "pending" || data.metadata?.resultCacheStatus === "failed") && onRefreshProgress && (
+        <button
+          type="button"
+          data-canvas-no-zoom
+          aria-label="重新获取原图"
+          title={data.metadata?.resultCacheError || "重新获取并保存原图"}
+          disabled={refreshingCache}
+          className="absolute right-1.5 bottom-1.5 grid size-7 place-items-center rounded-md bg-amber-600/90 text-white shadow-sm transition-colors hover:bg-amber-700 disabled:cursor-not-allowed disabled:opacity-60"
+          onPointerDown={(event) => event.stopPropagation()}
+          onClick={() => {
+            setRefreshingCache(true);
+            void Promise.resolve(onRefreshProgress(data)).finally(() => setRefreshingCache(false));
+          }}
+        >
+          <RefreshCw className={cn("size-3.5", refreshingCache && "animate-spin")} />
         </button>
       )}
 

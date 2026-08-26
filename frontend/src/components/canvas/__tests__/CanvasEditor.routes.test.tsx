@@ -8,6 +8,7 @@ import { CanvasNodeType, type CanvasNodeData } from "../types";
 
 const submitNodeGenerationMock = vi.hoisted(() => vi.fn());
 const pollNodeTaskMock = vi.hoisted(() => vi.fn());
+const checkExistingTaskMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../canvas-generation-service", async () => {
   const actual = await vi.importActual<typeof import("../canvas-generation-service")>("../canvas-generation-service");
@@ -15,6 +16,7 @@ vi.mock("../canvas-generation-service", async () => {
     ...actual,
     submitNodeGeneration: submitNodeGenerationMock,
     pollNodeTask: pollNodeTaskMock,
+    checkExistingTask: checkExistingTaskMock,
   };
 });
 
@@ -84,6 +86,7 @@ describe("CanvasEditor prompt routes", () => {
     submitNodeGenerationMock.mockResolvedValue("task-1");
     pollNodeTaskMock.mockReset();
     pollNodeTaskMock.mockResolvedValue([]);
+    checkExistingTaskMock.mockReset().mockResolvedValue({ status: "processing" });
   });
 
   afterEach(() => {
@@ -320,6 +323,79 @@ describe("CanvasEditor prompt routes", () => {
 
     second.reject(new Error("API 请求失败: 502"));
     await waitFor(() => expect(generateButton).not.toBeDisabled());
+  });
+
+  it("keeps a completed remote result visible while local caching is pending", async () => {
+    const seeded = structuredClone(project);
+    const config = seeded.nodes.find((node) => node.id === "config-1")!;
+    config.metadata = {
+      ...config.metadata,
+      promptRouteSelection: { mode: "route", connectionIds: ["core-concept", "concept-beijing", "beijing-config-1"] },
+    };
+    useCanvasStore.setState({ hydrated: true, projects: [seeded] });
+    pollNodeTaskMock.mockResolvedValue([{
+      url: "/api/nova/images/task-1/0",
+      remoteUrl: "/api/nova/images/task-1/0",
+      width: 1024,
+      height: 1024,
+      mimeType: "image/png",
+      bytes: 0,
+      cacheStatus: "pending",
+      cacheError: "HTTP 503",
+    }]);
+
+    render(<CanvasEditor projectId={project.id} onBack={() => undefined} onRequireApiKey={() => undefined} showToast={() => undefined} />);
+    fireEvent.click(screen.getByRole("button", { name: "生成" }));
+
+    await waitFor(() => {
+      const resultNode = useCanvasStore.getState().openProject(project.id)?.nodes.find((node) => node.type === CanvasNodeType.Image);
+      expect(resultNode?.metadata).toEqual(expect.objectContaining({
+        content: "/api/nova/images/task-1/0",
+        resultRemoteUrl: "/api/nova/images/task-1/0",
+        resultCacheStatus: "pending",
+        resultCacheError: "HTTP 503",
+      }));
+      expect(screen.getByRole("img", { name: "北京生成配置1 - 结果 1" })).toHaveAttribute("src", "/api/nova/images/task-1/0");
+      expect(screen.getByRole("button", { name: "重新获取原图" })).toBeInTheDocument();
+    });
+  });
+
+  it("resumes caching a pending result after the canvas is reopened", async () => {
+    const originalSetTimeout = globalThis.setTimeout;
+    const timeoutSpy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((handler: TimerHandler, timeout?: number, ...args: unknown[]) =>
+      originalSetTimeout(handler, timeout === 15_000 ? 0 : timeout, ...args)) as typeof setTimeout);
+    try {
+      const seeded = structuredClone(project);
+      seeded.nodes.push({
+        id: "result-1",
+        title: "北京结果",
+        type: CanvasNodeType.Image,
+        position: { x: 1200, y: 40 },
+        width: 360,
+        height: 360,
+        metadata: {
+          status: "success",
+          content: "/api/nova/images/task-1/0",
+          generationTaskId: "task-1",
+          resultCacheStatus: "pending",
+          resultRemoteUrl: "/api/nova/images/task-1/0",
+        },
+      });
+      useCanvasStore.setState({ hydrated: true, projects: [seeded] });
+      checkExistingTaskMock.mockResolvedValue({
+        status: "completed",
+        images: [{ storageKey: "image:1", url: "blob:image-1", width: 1024, height: 1024, mimeType: "image/png", bytes: 128, cacheStatus: "cached" }],
+      });
+
+      render(<CanvasEditor projectId={project.id} onBack={() => undefined} onRequireApiKey={() => undefined} showToast={() => undefined} />);
+      await waitFor(() => {
+        const resultNode = useCanvasStore.getState().openProject(project.id)?.nodes.find((node) => node.id === "result-1");
+        expect(checkExistingTaskMock).toHaveBeenCalledWith("task-1", 1);
+        expect(resultNode?.metadata).toEqual(expect.objectContaining({ storageKey: "image:1", resultCacheStatus: "cached" }));
+      });
+    } finally {
+      timeoutSpy.mockRestore();
+    }
   });
 
   it("previews the final prompt before generation", async () => {

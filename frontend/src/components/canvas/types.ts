@@ -68,6 +68,12 @@ export type CanvasNodeMetadata = {
   storageKey?: string;
   mimeType?: string;
   bytes?: number;
+  /** 生成结果是否已经持久化到本地图片存储。 */
+  resultCacheStatus?: "pending" | "cached" | "failed";
+  /** 本地缓存失败时保留的后端图片地址。 */
+  resultRemoteUrl?: string;
+  /** 最近一次缓存失败原因。 */
+  resultCacheError?: string;
   /** 配置节点的逐节点生成参数 */
   genConfig?: CanvasGenerationConfig;
   /** 配置节点：锁定结果节点模式 */
