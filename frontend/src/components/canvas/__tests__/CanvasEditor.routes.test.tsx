@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { CanvasEditor } from "../CanvasEditor";
 import { useCanvasStore, type CanvasProject } from "../stores/use-canvas-store";
+import { useCanvasConfigStore } from "../stores/use-canvas-config-store";
 import { CanvasNodeType, type CanvasNodeData } from "../types";
 
 const submitNodeGenerationMock = vi.hoisted(() => vi.fn());
@@ -63,6 +64,16 @@ class ResizeObserverStub {
   observe() {}
   disconnect() {}
   unobserve() {}
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 describe("CanvasEditor prompt routes", () => {
@@ -281,6 +292,34 @@ describe("CanvasEditor prompt routes", () => {
       const resultNode = useCanvasStore.getState().openProject(project.id)?.nodes.find((node) => node.type === CanvasNodeType.Image);
       expect(resultNode?.title).toBe("北京生成配置1 - 结果 1");
     });
+  });
+
+  it("resets the generate button only after all parallel results settle", async () => {
+    const seeded = structuredClone(project);
+    const config = seeded.nodes.find((node) => node.id === "config-1")!;
+    config.metadata = {
+      ...config.metadata,
+      genConfig: { ...useCanvasConfigStore.getState().config, count: 2 },
+    };
+    useCanvasStore.setState({ hydrated: true, projects: [seeded] });
+
+    const first = deferred<never[]>();
+    const second = deferred<never[]>();
+    submitNodeGenerationMock.mockResolvedValueOnce("task-1").mockResolvedValueOnce("task-2");
+    pollNodeTaskMock.mockImplementationOnce(() => first.promise).mockImplementationOnce(() => second.promise);
+
+    render(<CanvasEditor projectId={project.id} onBack={() => undefined} onRequireApiKey={() => undefined} showToast={() => undefined} />);
+    const generateButton = screen.getByRole("button", { name: "生成" });
+    fireEvent.click(generateButton);
+
+    await waitFor(() => expect(pollNodeTaskMock).toHaveBeenCalledTimes(2));
+    expect(generateButton).toBeDisabled();
+
+    first.resolve([]);
+    await waitFor(() => expect(generateButton).toBeDisabled());
+
+    second.reject(new Error("API 请求失败: 502"));
+    await waitFor(() => expect(generateButton).not.toBeDisabled());
   });
 
   it("previews the final prompt before generation", async () => {

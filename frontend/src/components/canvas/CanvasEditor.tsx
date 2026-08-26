@@ -69,6 +69,12 @@ type CanvasEditorProps = {
 
 const MAX_HISTORY = 50;
 
+type GenerationActivity = {
+  controller: AbortController;
+  sourceNodeId: string;
+  token: symbol | null;
+};
+
 function connectedNodeIds(seedId: string, connections: CanvasConnection[]) {
   const visited = new Set([seedId]);
   const queue = [seedId];
@@ -294,7 +300,10 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
   >(null);
   const gestureActive = useRef(false);
   const clipboard = useRef<{ nodes: CanvasNodeData[]; connections: CanvasConnection[] }>({ nodes: [], connections: [] });
-  const activeGenerationsRef = useRef<Map<string, AbortController>>(new Map());
+  const activeGenerationsRef = useRef<Map<string, GenerationActivity>>(new Map());
+  // Each generation owns one activity token. A source node stays busy until
+  // every child generation that it started has reached its finally block.
+  const generationActivityRef = useRef<Map<string, Set<symbol>>>(new Map());
   const retryCooldownRef = useRef<Map<string, number>>(new Map());
   const textGenerationControllersRef = useRef<Map<string, AbortController>>(new Map());
   const [undoStack, setUndoStack] = useState<HistorySnapshot[]>([]);
@@ -835,6 +844,36 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
     setBusyNodeIds((prev) => (busy ? [...new Set([...prev, nodeId])] : prev.filter((id) => id !== nodeId)));
   }, []);
 
+  const beginGenerationActivity = useCallback((sourceNodeId: string): symbol | null => {
+    if (!sourceNodeId) return null;
+    const token = Symbol(sourceNodeId);
+    const active = generationActivityRef.current.get(sourceNodeId) ?? new Set<symbol>();
+    active.add(token);
+    generationActivityRef.current.set(sourceNodeId, active);
+    setBusy(sourceNodeId, true);
+    return token;
+  }, [setBusy]);
+
+  const endGenerationActivity = useCallback((sourceNodeId: string, token: symbol | null) => {
+    if (!sourceNodeId || !token) return;
+    const active = generationActivityRef.current.get(sourceNodeId);
+    // Ignore duplicate cleanup (for example, an explicit cancellation followed
+    // by the cancelled promise's finally block).
+    if (!active || !active.delete(token)) return;
+    if (active.size > 0) return;
+    generationActivityRef.current.delete(sourceNodeId);
+    setBusy(sourceNodeId, false);
+  }, [setBusy]);
+
+  const clearGenerationActivity = useCallback((nodeId: string) => {
+    const activity = activeGenerationsRef.current.get(nodeId);
+    if (!activity) return;
+    activity.controller.abort();
+    if (activeGenerationsRef.current.get(nodeId) !== activity) return;
+    activeGenerationsRef.current.delete(nodeId);
+    endGenerationActivity(activity.sourceNodeId, activity.token);
+  }, [endGenerationActivity]);
+
   const getConfigReferenceLimit = useCallback(
     (configNode: CanvasNodeData) => {
       const promptText = configNode.metadata?.composerContent ?? configNode.metadata?.prompt ?? "";
@@ -880,13 +919,14 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
   const startNodeGeneration = useCallback(
     async (nodeId: string, promptText: string, referenceImages: ReferenceImage[], genConfig: CanvasGenerationConfig, sourceNodeId: string) => {
       // 取消该节点之前的任务（如有）
-      activeGenerationsRef.current.get(nodeId)?.abort();
+      clearGenerationActivity(nodeId);
       const controller = new AbortController();
-      activeGenerationsRef.current.set(nodeId, controller);
+      const activityToken = beginGenerationActivity(sourceNodeId);
+      const activity: GenerationActivity = { controller, sourceNodeId, token: activityToken };
+      activeGenerationsRef.current.set(nodeId, activity);
 
       // 立即标记节点为提交中状态（同步，确保 UI 即时更新）
       setNodes((prev) => prev.map((node) => (node.id === nodeId ? { ...node, metadata: { ...node.metadata, status: "submitting", errorDetails: undefined, generationTaskId: undefined, generationStartedAt: Date.now() } } : node)));
-      setBusy(sourceNodeId, true);
 
       try {
         const taskId = await submitNodeGeneration({ prompt: promptText, referenceImages, config: genConfig });
@@ -914,18 +954,15 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
           setNodes((prev) => prev.map((node) => (node.id === nodeId ? { ...node, metadata: { ...node.metadata, status: "error", errorDetails: message } } : node)));
         }
       } finally {
-        activeGenerationsRef.current.delete(nodeId);
-        // 检查该编排节点是否还有其他活跃子任务
-        let hasActive = false;
-        for (const key of activeGenerationsRef.current.keys()) {
-          if (key === nodeId) continue;
-          const n = nodes.find((item) => item.id === key);
-          if (n && n.metadata?.generationStartedAt) { hasActive = true; break; }
+        // Only the task that still owns this map entry may remove it. An old
+        // retry must never delete the controller belonging to the newer retry.
+        if (activeGenerationsRef.current.get(nodeId) === activity) {
+          activeGenerationsRef.current.delete(nodeId);
         }
-        if (!hasActive) setBusy(sourceNodeId, false);
+        endGenerationActivity(sourceNodeId, activityToken);
       }
     },
-    [nodes, onRequireApiKey, setBusy],
+    [beginGenerationActivity, clearGenerationActivity, endGenerationActivity, onRequireApiKey],
   );
 
   const runGeneration = useCallback(
@@ -1046,13 +1083,13 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
         if (result.status === "completed" && result.images?.length) {
           const image = result.images[0];
           const size = fitNodeSize(image.width, image.height, 360, 360);
-          activeGenerationsRef.current.get(node.id)?.abort();
-          activeGenerationsRef.current.delete(node.id);
+          clearGenerationActivity(node.id);
           patchNode(node.id, (n) => ({ ...n, width: size.width, height: size.height, metadata: { ...n.metadata, ...storedToMetadata(image, { prompt: n.metadata?.prompt }), generationTaskId: n.metadata?.generationTaskId, generationStartedAt: n.metadata?.generationStartedAt } }));
           showToast("已取回生成结果", "success");
           return;
         }
         if (result.status === "failed" || result.status === "expired") {
+          clearGenerationActivity(node.id);
           patchNode(node.id, (n) => ({ ...n, metadata: { ...n.metadata, status: "error", errorDetails: result.error || "生成失败" } }));
           showToast("任务已失败", "error");
           return;
@@ -1063,7 +1100,7 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
         showToast("获取进度失败", "error");
       }
     },
-    [patchNode, showToast],
+    [clearGenerationActivity, patchNode, showToast],
   );
 
   // 刷新页面后恢复进行中的生成任务（检查已有 taskId 的状态）
@@ -1077,7 +1114,8 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
     for (const node of activeNodes) {
       const taskId = node.metadata!.generationTaskId!;
       const controller = new AbortController();
-      activeGenerationsRef.current.set(node.id, controller);
+      const activity: GenerationActivity = { controller, sourceNodeId: "", token: null };
+      activeGenerationsRef.current.set(node.id, activity);
 
       void (async () => {
         try {
@@ -1114,7 +1152,9 @@ export function CanvasEditor({ projectId, onBack, onRequireApiKey, showToast, sh
           if (controller.signal.aborted) return;
           patchNode(node.id, (n) => ({ ...n, metadata: { ...n.metadata, status: "error", errorDetails: "恢复生成状态失败" } }));
         } finally {
-          activeGenerationsRef.current.delete(node.id);
+          if (activeGenerationsRef.current.get(node.id) === activity) {
+            activeGenerationsRef.current.delete(node.id);
+          }
         }
       })();
     }
